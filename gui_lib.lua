@@ -1152,11 +1152,24 @@ function Section:AddKeybind(options)
     corner(keyButton, 5)
     local value = options.Default or Enum.KeyCode.Unknown
     local listening = false
+    local ignoreNextActivation = false
+    local mouseButtonNames = {
+        [Enum.UserInputType.MouseButton1] = "Mouse 1",
+        [Enum.UserInputType.MouseButton2] = "Mouse 2",
+        [Enum.UserInputType.MouseButton3] = "Mouse 3",
+    }
+    local function isSupported(nextValue)
+        return typeof(nextValue) == "EnumItem"
+            and (nextValue.EnumType == Enum.KeyCode or mouseButtonNames[nextValue] ~= nil)
+    end
     local function keyName(key)
-        return key == Enum.KeyCode.Unknown and "None" or key.Name
+        if key == Enum.KeyCode.Unknown then
+            return "None"
+        end
+        return mouseButtonNames[key] or key.Name
     end
     local function set(nextValue, silent)
-        if typeof(nextValue) == "EnumItem" then value = nextValue end
+        if isSupported(nextValue) then value = nextValue end
         keyButton.Text = keyName(value)
         if options.Flag then Library.Flags[options.Flag] = value end
         if not silent then safeCall(options.Changed, value) end
@@ -1165,8 +1178,12 @@ function Section:AddKeybind(options)
         keyButton.TextColor3 = listening and Library.Theme.Accent or Library.Theme.MutedText
     end)
     connect(keyButton.Activated, function()
+        if ignoreNextActivation then
+            ignoreNextActivation = false
+            return
+        end
         listening = true
-        keyButton.Text = "Press a key..."
+        keyButton.Text = "Press key/mouse..."
         tween(keyButton, 0.15, { TextColor3 = Library.Theme.Accent })
     end, self.Window._connections)
     connect(UserInputService.InputBegan, function(input, processed)
@@ -1175,10 +1192,24 @@ function Section:AddKeybind(options)
                 listening = false
                 set(input.KeyCode)
                 tween(keyButton, 0.15, { TextColor3 = Library.Theme.MutedText })
+            elseif mouseButtonNames[input.UserInputType] then
+                listening = false
+                local point = input.Position
+                local topLeft = keyButton.AbsolutePosition
+                local bottomRight = topLeft + keyButton.AbsoluteSize
+                ignoreNextActivation = input.UserInputType == Enum.UserInputType.MouseButton1
+                    and point.X >= topLeft.X and point.X <= bottomRight.X
+                    and point.Y >= topLeft.Y and point.Y <= bottomRight.Y
+                set(input.UserInputType)
+                tween(keyButton, 0.15, { TextColor3 = Library.Theme.MutedText })
             end
             return
         end
-        if not processed and input.KeyCode == value then
+        local matches = value.EnumType == Enum.KeyCode
+            and input.UserInputType == Enum.UserInputType.Keyboard
+            and input.KeyCode == value
+            or (mouseButtonNames[value] ~= nil and input.UserInputType == value)
+        if not processed and matches then
             safeCall(options.Callback, value)
         end
     end, self.Window._connections)

@@ -165,11 +165,11 @@ themeSection:AddButton({
 local inputSection = appearanceTab:AddSection("keyboard thing")
 
 inputSection:AddKeybind({
-    Name = "popup key",
+    Name = "popup key / mouse button",
     Flag = "notificationKey",
     Default = Enum.KeyCode.N,
-    Changed = function(key)
-        print("new key", key.Name)
+    Changed = function(input)
+        print("new input", input.Name)
     end,
     Callback = function()
         Bloodshot:Notify({
