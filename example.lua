@@ -1,5 +1,5 @@
 local Bloodshot = loadstring(game:HttpGet(
-    "https://raw.githubusercontent.com/n3987frejhw098h324/GUI-LIB/refs/heads/main/gui_lib.lua"
+    "https://raw.githubusercontent.com/n3987frejhw098h324/bloodshot-ui/refs/heads/main/gui_lib.lua"
 ))()
 
 -- window thing
