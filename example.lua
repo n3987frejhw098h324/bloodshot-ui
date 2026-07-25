@@ -250,6 +250,109 @@ lifecycleSection:AddButton({
     end,
 })
 
+-- v2 controls
+local v2Tab = window:AddTab({ Name = "v2 extras" })
+local modernSection = v2Tab:AddSection({
+    Name = "modern controls",
+    Collapsible = true,
+})
+
+modernSection:AddDivider({ Text = "numeric values" })
+
+modernSection:AddNumberInput({
+    Name = "maximum players",
+    Flag = "maxPlayers",
+    Min = 1,
+    Max = 100,
+    Increment = 1,
+    Default = 12,
+    Tooltip = "A validated numeric input.",
+    Callback = function(value)
+        print("maximum players", value)
+    end,
+})
+
+modernSection:AddRangeSlider({
+    Name = "distance",
+    Flag = "distanceRange",
+    Min = 0,
+    Max = 1000,
+    Increment = 10,
+    Default = { 100, 500 },
+    Suffix = " studs",
+    Callback = function(low, high)
+        print("range", low, high)
+    end,
+})
+
+modernSection:AddSegmented({
+    Name = "alignment",
+    Flag = "alignment",
+    Values = { "Left", "Center", "Right" },
+    Default = "Center",
+})
+
+modernSection:AddRadio({
+    Name = "difficulty",
+    Flag = "difficulty",
+    Values = { "Easy", "Normal", "Hard" },
+    Default = "Normal",
+    MaxVisibleRows = 3,
+    Searchable = true,
+})
+
+modernSection:AddKeybind({
+    Name = "hold action",
+    Default = Enum.KeyCode.LeftAlt,
+    Mode = "Hold",
+    Callback = function(active)
+        print("hold active", active)
+    end,
+})
+
+modernSection:AddButton({
+    Name = "confirmation dialog",
+    Callback = function()
+        Bloodshot:Confirm({
+            Title = "Use high contrast?",
+            Content = "You can restore the Bloodshot preset at any time.",
+            Callback = function(confirmed)
+                if confirmed then
+                    Bloodshot:SetThemePreset("High Contrast")
+                end
+            end,
+        })
+    end,
+})
+
+local managementSection = v2Tab:AddSection("runtime management")
+managementSection:AddInput({
+    Name = "search this tab",
+    Placeholder = "control or section name",
+    Callback = function(query)
+        v2Tab:Search(query)
+    end,
+})
+
+managementSection:AddButton({
+    Name = "rename window",
+    Callback = function()
+        window:SetTitle("blood shot gui v2", "modernized and compatible")
+    end,
+})
+
+managementSection:AddButton({
+    Name = "toggle reduced motion",
+    Callback = function()
+        local enabled = not Bloodshot._reducedMotion
+        Bloodshot:SetReducedMotion(enabled)
+        Bloodshot:Notify({
+            Title = "Reduced motion",
+            Content = enabled and "Enabled" or "Disabled",
+        })
+    end,
+})
+
 lifecycleSection:AddButton({
     Name = "hide it",
     Description = "right shift bring it back probably",
