@@ -11,7 +11,8 @@ local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 
 local Library = {
-    Version = "1.0.0",
+    Version = "2.0.0",
+    ConfigVersion = 2,
     Flags = {},
     Theme = {
         Background = Color3.fromRGB(7, 7, 9),
@@ -28,13 +29,75 @@ local Library = {
         BackgroundGradient = Color3.fromRGB(24, 7, 11),
         SurfaceGradient = Color3.fromRGB(38, 10, 16),
         AccentGradient = Color3.fromRGB(104, 8, 22),
+        Disabled = Color3.fromRGB(82, 72, 75),
+        Focus = Color3.fromRGB(245, 92, 112),
+        Overlay = Color3.fromRGB(3, 3, 4),
+        CornerRadius = 6,
+        ControlTransparency = 0.8,
+        Font = Enum.Font.Gotham,
+        FontMedium = Enum.Font.GothamMedium,
+        FontBold = Enum.Font.GothamBold,
     },
+    ThemePresets = {},
     _windows = {},
     _connections = {},
     _themeBindings = {},
     _flagSetters = {},
     _notifications = {},
     _destroyed = false,
+    _animationSpeed = 1,
+    _reducedMotion = false,
+    _flagTypes = {},
+}
+
+local DEFAULT_THEME
+local function copyTable(source)
+    local result = {}
+    for key, value in pairs(source) do
+        result[key] = type(value) == "table" and copyTable(value) or value
+    end
+    return result
+end
+
+DEFAULT_THEME = copyTable(Library.Theme)
+Library.ThemePresets.Bloodshot = copyTable(DEFAULT_THEME)
+Library.ThemePresets["Crimson Light"] = {
+    Background = Color3.fromRGB(244, 238, 239),
+    Surface = Color3.fromRGB(255, 250, 251),
+    SurfaceAlt = Color3.fromRGB(237, 225, 228),
+    Border = Color3.fromRGB(183, 142, 150),
+    Text = Color3.fromRGB(38, 20, 24),
+    MutedText = Color3.fromRGB(105, 78, 84),
+    Accent = Color3.fromRGB(185, 25, 51),
+    AccentDark = Color3.fromRGB(105, 14, 30),
+    Success = Color3.fromRGB(36, 145, 82),
+    Warning = Color3.fromRGB(184, 112, 18),
+    Error = Color3.fromRGB(205, 38, 60),
+    BackgroundGradient = Color3.fromRGB(231, 210, 215),
+    SurfaceGradient = Color3.fromRGB(245, 224, 229),
+    AccentGradient = Color3.fromRGB(223, 77, 99),
+    Disabled = Color3.fromRGB(155, 143, 146),
+    Focus = Color3.fromRGB(225, 44, 73),
+    Overlay = Color3.fromRGB(50, 38, 41),
+}
+Library.ThemePresets["High Contrast"] = {
+    Background = Color3.fromRGB(0, 0, 0),
+    Surface = Color3.fromRGB(8, 8, 8),
+    SurfaceAlt = Color3.fromRGB(20, 20, 20),
+    Border = Color3.fromRGB(235, 235, 235),
+    Text = Color3.fromRGB(255, 255, 255),
+    MutedText = Color3.fromRGB(210, 210, 210),
+    Accent = Color3.fromRGB(255, 45, 75),
+    AccentDark = Color3.fromRGB(155, 0, 24),
+    Success = Color3.fromRGB(40, 255, 130),
+    Warning = Color3.fromRGB(255, 205, 40),
+    Error = Color3.fromRGB(255, 45, 75),
+    BackgroundGradient = Color3.fromRGB(16, 0, 3),
+    SurfaceGradient = Color3.fromRGB(35, 0, 7),
+    AccentGradient = Color3.fromRGB(255, 90, 110),
+    Disabled = Color3.fromRGB(125, 125, 125),
+    Focus = Color3.fromRGB(255, 235, 70),
+    Overlay = Color3.fromRGB(0, 0, 0),
 }
 
 local function new(className, properties, children)
@@ -55,7 +118,7 @@ end
 
 local function corner(parent, radius)
     return new("UICorner", {
-        CornerRadius = UDim.new(0, radius or 6),
+        CornerRadius = UDim.new(0, radius or Library.Theme.CornerRadius or 6),
         Parent = parent,
     })
 end
@@ -89,8 +152,23 @@ local function padding(parent, top, right, bottom, left)
 end
 
 local function tween(object, duration, properties, style, direction)
+    if not object or not object.Parent then
+        return nil
+    end
+    if Library._reducedMotion then
+        for property, value in pairs(properties) do
+            object[property] = value
+        end
+        return {
+            Cancel = function() end,
+            Completed = {
+                Connect = function(_, callback) callback(); return { Disconnect = function() end } end,
+                Wait = function() end,
+            },
+        }
+    end
     local info = TweenInfo.new(
-        duration or 0.18,
+        (duration or 0.18) / math.max(0.05, Library._animationSpeed),
         style or Enum.EasingStyle.Quint,
         direction or Enum.EasingDirection.Out
     )
@@ -160,7 +238,7 @@ local function text(parent, value, size, colorKey, properties)
         Position = properties.Position or UDim2.new(),
         AnchorPoint = properties.AnchorPoint or Vector2.zero,
         AutomaticSize = properties.AutomaticSize or Enum.AutomaticSize.None,
-        Font = properties.Font or Enum.Font.Gotham,
+        Font = properties.Font or Library.Theme.Font or Enum.Font.Gotham,
         Text = tostring(value or ""),
         TextSize = textSize,
         TextScaled = scaled,
@@ -221,6 +299,9 @@ end
 local function registerFlagSetter(window, flag, setter)
     if not flag then
         return
+    end
+    if Library._flagSetters[flag] and Library._flagSetters[flag] ~= setter then
+        warn("[Bloodshot UI] Duplicate flag '" .. tostring(flag) .. "'; newest live control wins")
     end
     Library._flagSetters[flag] = setter
     window._flagSetters[flag] = setter
@@ -348,7 +429,7 @@ function Library:SetTheme(theme)
     end
 
     for key, value in pairs(updates) do
-        if self.Theme[key] ~= nil and typeof(value) == "Color3" then
+        if self.Theme[key] ~= nil and typeof(value) == typeof(self.Theme[key]) then
             self.Theme[key] = value
         end
     end
@@ -371,6 +452,36 @@ function Library:SetTheme(theme)
     end
 end
 
+function Library:GetTheme()
+    return copyTable(self.Theme)
+end
+
+function Library:ResetTheme()
+    self:SetTheme(DEFAULT_THEME)
+end
+
+function Library:SetThemePreset(name)
+    local preset = self.ThemePresets[name]
+    if not preset then
+        return false, "Unknown theme preset: " .. tostring(name)
+    end
+    self:SetTheme(preset)
+    return true
+end
+
+function Library:SetReducedMotion(enabled)
+    self._reducedMotion = not not enabled
+end
+
+function Library:SetAnimationSpeed(multiplier)
+    multiplier = tonumber(multiplier)
+    if not multiplier or multiplier ~= multiplier or multiplier <= 0 then
+        return false, "Animation speed must be a positive finite number"
+    end
+    self._animationSpeed = math.clamp(multiplier, 0.05, 10)
+    return true
+end
+
 function Library:SetFlag(flag, value, silent)
     self.Flags[flag] = value
     local setter = self._flagSetters[flag]
@@ -387,9 +498,22 @@ function Library:GetFlag(flag, fallback)
     return value
 end
 
-function Library:SaveConfig()
+local function makeFilter(values)
+    if type(values) ~= "table" then return nil end
+    local result = {}
+    for key, value in pairs(values) do
+        if type(key) == "number" then result[value] = true elseif value then result[key] = true end
+    end
+    return result
+end
+
+function Library:SaveConfig(options)
+    options = type(options) == "table" and options or {}
+    local include = makeFilter(options.Include)
+    local exclude = makeFilter(options.Exclude)
     local encoded = {}
     for flag, value in pairs(self.Flags) do
+        if (not include or include[flag]) and (not exclude or not exclude[flag]) then
         local kind = typeof(value)
         if kind == "Color3" then
             encoded[flag] = {
@@ -404,20 +528,43 @@ function Library:SaveConfig()
         elseif kind == "boolean" or kind == "number" or kind == "string" or kind == "table" then
             encoded[flag] = value
         end
+        end
     end
-    local ok, result = pcall(HttpService.JSONEncode, HttpService, encoded)
+    local payload = {
+        __bloodshot = self.ConfigVersion,
+        flags = encoded,
+        metadata = options.Metadata,
+    }
+    local ok, result = pcall(HttpService.JSONEncode, HttpService, payload)
     if not ok then
         return nil, "Unable to encode configuration: " .. tostring(result)
     end
     return result
 end
 
-function Library:LoadConfig(json, silent)
+function Library:LoadConfig(json, options)
+    local silent
+    local strict = false
+    if type(options) == "table" then
+        silent = options.Silent
+        strict = options.Strict == true
+    else
+        silent = options
+    end
     local ok, decoded = pcall(HttpService.JSONDecode, HttpService, json)
     if not ok or type(decoded) ~= "table" then
         return false, "Invalid configuration"
     end
+    if decoded.__bloodshot ~= nil then
+        if type(decoded.flags) ~= "table" then
+            return false, "Invalid versioned configuration"
+        end
+        decoded = decoded.flags
+    end
     for flag, value in pairs(decoded) do
+        if strict and not self._flagSetters[flag] then
+            return false, "Unknown flag " .. tostring(flag)
+        end
         if type(value) == "table" and value.__type == "Color3" then
             local rgb = value.value
             if type(rgb) ~= "table"
@@ -425,6 +572,9 @@ function Library:LoadConfig(json, silent)
                 or type(rgb[2]) ~= "number"
                 or type(rgb[3]) ~= "number" then
                 return false, "Invalid Color3 value for flag " .. tostring(flag)
+            end
+            if rgb[1] < 0 or rgb[1] > 1 or rgb[2] < 0 or rgb[2] > 1 or rgb[3] < 0 or rgb[3] > 1 then
+                return false, "Color3 channels must be between 0 and 1 for flag " .. tostring(flag)
             end
             value = Color3.new(rgb[1], rgb[2], rgb[3])
         elseif type(value) == "table" and value.__type == "EnumItem" then
@@ -439,9 +589,43 @@ function Library:LoadConfig(json, silent)
             end
             value = enumItem
         end
+        if type(value) == "number" and (value ~= value or value == math.huge or value == -math.huge) then
+            return false, "Invalid finite number for flag " .. tostring(flag)
+        end
+        local expected = self._flagTypes[flag]
+        if strict and expected and typeof(value) ~= expected then
+            return false, "Invalid type for flag " .. tostring(flag) .. "; expected " .. expected
+        end
         self:SetFlag(flag, value, silent)
     end
     return true
+end
+
+function Library:SetConfigAdapter(adapter)
+    if adapter ~= nil and type(adapter) ~= "table" then
+        return false, "Config adapter must be a table"
+    end
+    if adapter and (type(adapter.Read) ~= "function" or type(adapter.Write) ~= "function") then
+        return false, "Config adapter requires Read(name) and Write(name, json)"
+    end
+    self._configAdapter = adapter
+    return true
+end
+
+function Library:SaveProfile(name, options)
+    if not self._configAdapter then return false, "No config adapter configured" end
+    local json, message = self:SaveConfig(options)
+    if not json then return false, message end
+    local ok, result = pcall(self._configAdapter.Write, self._configAdapter, tostring(name), json)
+    if not ok or result == false then return false, tostring(result) end
+    return true
+end
+
+function Library:LoadProfile(name, options)
+    if not self._configAdapter then return false, "No config adapter configured" end
+    local ok, json = pcall(self._configAdapter.Read, self._configAdapter, tostring(name))
+    if not ok or type(json) ~= "string" then return false, tostring(json) end
+    return self:LoadConfig(json, options)
 end
 
 function Library:Notify(options)
@@ -523,6 +707,64 @@ function Library:Notify(options)
     return card
 end
 
+function Library:Confirm(options)
+    options = options or {}
+    local overlay = new("TextButton", {
+        Name = "ConfirmationOverlay",
+        BackgroundColor3 = self.Theme.Overlay,
+        BackgroundTransparency = 0.28,
+        BorderSizePixel = 0,
+        Size = UDim2.fromScale(1, 1),
+        Text = "",
+        AutoButtonColor = false,
+        ZIndex = 100,
+        Parent = ScreenGui,
+    })
+    local card = new("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromOffset(360, 170),
+        BorderSizePixel = 0,
+        ZIndex = 101,
+        Parent = overlay,
+    })
+    bindTheme(card, "BackgroundColor3", "Surface")
+    corner(card, 9)
+    stroke(card, self.Theme.Border, 1, 0.1, "Border")
+    text(card, options.Title or "Confirm", 16, "Text", {
+        Position = UDim2.fromOffset(18, 16), Size = UDim2.new(1, -36, 0, 24),
+        Font = Enum.Font.GothamBold, ZIndex = 102,
+    })
+    text(card, options.Content or options.Description or "Are you sure?", 12, "MutedText", {
+        Position = UDim2.fromOffset(18, 48), Size = UDim2.new(1, -36, 0, 50),
+        TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top, ZIndex = 102,
+    })
+    local resolved = false
+    local function resolve(result)
+        if resolved then return end
+        resolved = true
+        safeCall(options.Callback, result)
+        if overlay.Parent then overlay:Destroy() end
+    end
+    local cancel = new("TextButton", {
+        Position = UDim2.new(0.5, -112, 1, -48), Size = UDim2.fromOffset(104, 32),
+        BackgroundColor3 = self.Theme.SurfaceAlt, BorderSizePixel = 0,
+        Text = options.CancelText or "Cancel", TextColor3 = self.Theme.MutedText,
+        Font = Enum.Font.GothamMedium, TextSize = 12, ZIndex = 102, Parent = card,
+    })
+    local confirm = new("TextButton", {
+        Position = UDim2.new(0.5, 8, 1, -48), Size = UDim2.fromOffset(104, 32),
+        BackgroundColor3 = self.Theme.Accent, BorderSizePixel = 0,
+        Text = options.ConfirmText or "Confirm", TextColor3 = self.Theme.Text,
+        Font = Enum.Font.GothamMedium, TextSize = 12, ZIndex = 102, Parent = card,
+    })
+    corner(cancel, 6); corner(confirm, 6)
+    connect(cancel.Activated, function() resolve(false) end)
+    connect(confirm.Activated, function() resolve(true) end)
+    connect(overlay.Activated, function() if options.DismissOnOverlay ~= false then resolve(false) end end)
+    return { Instance = overlay, Close = function(_, result) resolve(result == true) end }
+end
+
 local function createControlBase(section, height, name, description)
     local holder = new("Frame", {
         Name = name or "Control",
@@ -536,13 +778,13 @@ local function createControlBase(section, height, name, description)
     gradient(holder, "SurfaceAlt", "SurfaceGradient", 12)
     corner(holder, 6)
     local holderStroke = stroke(holder, Library.Theme.Border, 1, 0.45, "Border")
-    tween(holder, 0.24, { BackgroundTransparency = 0.8 })
+    tween(holder, 0.24, { BackgroundTransparency = Library.Theme.ControlTransparency or 0.8 })
     connect(holder.MouseEnter, function()
         tween(holder, 0.16, { BackgroundTransparency = 0.68 })
         tween(holderStroke, 0.16, { Transparency = 0.2 })
     end, section.Window._connections)
     connect(holder.MouseLeave, function()
-        tween(holder, 0.16, { BackgroundTransparency = 0.8 })
+        tween(holder, 0.16, { BackgroundTransparency = Library.Theme.ControlTransparency or 0.8 })
         tween(holderStroke, 0.16, { Transparency = 0.45 })
     end, section.Window._connections)
 
@@ -558,6 +800,11 @@ local function createControlBase(section, height, name, description)
             Size = UDim2.new(1, -24, 0, 16),
         })
     end
+    holder:SetAttribute("BloodshotControl", true)
+    holder:SetAttribute("BloodshotDisabled", false)
+    holder:SetAttribute("BloodshotBaseHeight", height)
+    holder:SetAttribute("BloodshotHasDescription", description ~= nil)
+    holder:SetAttribute("BloodshotNameLabel", nameLabel.Name)
     return holder, nameLabel, descriptionLabel
 end
 
@@ -962,6 +1209,57 @@ function Section:AddDropdown(options)
     })
 
     local optionButtons = {}
+    local maxVisibleRows = math.clamp(math.floor(tonumber(options.MaxVisibleRows) or 5), 1, 12)
+    local searchBox
+    if options.Searchable == true then
+        searchBox = new("TextBox", {
+            Name = "Search",
+            LayoutOrder = -2,
+            BackgroundColor3 = Library.Theme.SurfaceAlt,
+            BorderSizePixel = 0,
+            Size = UDim2.new(1, 0, 0, 26),
+            ClearTextOnFocus = false,
+            PlaceholderText = options.SearchPlaceholder or "Search...",
+            PlaceholderColor3 = Library.Theme.MutedText,
+            Text = "",
+            TextColor3 = Library.Theme.Text,
+            Font = Enum.Font.Gotham,
+            TextSize = 11,
+            Parent = list,
+        })
+        corner(searchBox, 4)
+        bindTheme(searchBox, "BackgroundColor3", "SurfaceAlt")
+        bindTheme(searchBox, "PlaceholderColor3", "MutedText")
+        bindTheme(searchBox, "TextColor3", "Text")
+    end
+    local emptyLabel = text(list, options.EmptyText or "No options", 11, "MutedText", {
+        Size = UDim2.new(1, 0, 0, 26),
+        TextXAlignment = Enum.TextXAlignment.Center,
+    })
+    emptyLabel.LayoutOrder = -1
+    emptyLabel.Visible = false
+    local function filterOptions(query)
+        query = string.lower(tostring(query or ""))
+        local count = 0
+        for item, button in pairs(optionButtons) do
+            local visible = query == "" or string.find(string.lower(tostring(item)), query, 1, true) ~= nil
+            button.Visible = visible
+            if visible then count += 1 end
+        end
+        emptyLabel.Visible = count == 0
+        if open then
+            local searchHeight = searchBox and 29 or 0
+            local height = (count == 0 and 36 or math.min(count, maxVisibleRows) * 28 + 8) + searchHeight
+            list.Size = UDim2.new(1, -20, 0, height)
+            holder.Size = UDim2.new(1, 0, 0, baseHeight + height + 8)
+        end
+        return count
+    end
+    if searchBox then
+        connect(searchBox:GetPropertyChangedSignal("Text"), function()
+            filterOptions(searchBox.Text)
+        end, self.Window._connections)
+    end
     local function renderText()
         if multi then
             local names = {}
@@ -999,14 +1297,14 @@ function Section:AddDropdown(options)
             if type(nextValue) == "table" then
                 for key, enabled in pairs(nextValue) do
                     if type(key) == "number" then
-                        selected[enabled] = true
-                    elseif enabled then
+                        if table.find(values, enabled) then selected[enabled] = true end
+                    elseif enabled and table.find(values, key) then
                         selected[key] = true
                     end
                 end
             end
         else
-            selected = nextValue
+            selected = table.find(values, nextValue) and nextValue or nil
         end
         refreshButtons()
         local output = outputValue()
@@ -1015,7 +1313,8 @@ function Section:AddDropdown(options)
     end
     local function setOpen(nextOpen)
         open = not not nextOpen
-        local listHeight = math.min(#values * 28 + 8, 144)
+        local listHeight = math.min(#values, maxVisibleRows) * 28 + 8 + (searchBox and 29 or 0)
+        if #values == 0 then listHeight = 36 + (searchBox and 29 or 0) end
         if open then
             list.Visible = true
             list.Size = UDim2.new(1, -20, 0, 0)
@@ -1044,10 +1343,10 @@ function Section:AddDropdown(options)
         tween(arrow, 0.18, { Rotation = open and 180 or 0 }, Enum.EasingStyle.Back)
     end
     local function rebuild(nextValues)
-        values = nextValues or values
+        values = type(nextValues) == "table" and nextValues or values
         for _, button in pairs(optionButtons) do button:Destroy() end
         table.clear(optionButtons)
-        for _, item in ipairs(values) do
+        for index, item in ipairs(values) do
             local option = new("TextButton", {
                 BackgroundTransparency = 1,
                 BackgroundColor3 = Library.Theme.SurfaceAlt,
@@ -1058,6 +1357,7 @@ function Section:AddDropdown(options)
                 Text = "  " .. tostring(item),
                 TextSize = 11,
                 TextXAlignment = Enum.TextXAlignment.Left,
+                LayoutOrder = index,
                 Parent = list,
             })
             constrainText(option, 8, 11)
@@ -1100,6 +1400,7 @@ function Section:AddDropdown(options)
                 end
             end, self.Window._connections)
         end
+        emptyLabel.Visible = #values == 0
         refreshButtons()
     end
     connect(display.MouseEnter, function()
@@ -1116,6 +1417,15 @@ function Section:AddDropdown(options)
         end)
         setOpen(not open)
     end, self.Window._connections)
+    connect(UserInputService.InputBegan, function(input)
+        if not open or input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+        local point = input.Position
+        local topLeft = holder.AbsolutePosition
+        local bottomRight = topLeft + holder.AbsoluteSize
+        if point.X < topLeft.X or point.X > bottomRight.X or point.Y < topLeft.Y or point.Y > bottomRight.Y then
+            setOpen(false)
+        end
+    end, self.Window._connections)
     rebuild(values)
     set(options.Default, true)
     registerFlagSetter(self.Window, options.Flag, set)
@@ -1129,6 +1439,14 @@ function Section:AddDropdown(options)
             set(selected, true)
             if open then setOpen(true) end
         end,
+        SetValues = function(self, nextValues, keepSelection)
+            self:Refresh(nextValues, keepSelection)
+        end,
+        Search = function(_, query)
+            if searchBox then searchBox.Text = tostring(query or "") end
+            return filterOptions(query)
+        end,
+        SetOpen = function(_, nextOpen) setOpen(nextOpen) end,
     }
 end
 
@@ -1151,6 +1469,9 @@ function Section:AddKeybind(options)
     bindTheme(keyButton, "BackgroundColor3", "Background")
     corner(keyButton, 5)
     local value = options.Default or Enum.KeyCode.Unknown
+    local mode = string.lower(tostring(options.Mode or "Press"))
+    if mode ~= "press" and mode ~= "hold" and mode ~= "toggle" then mode = "press" end
+    local active = false
     local listening = false
     local ignoreNextActivation = false
     local mouseButtonNames = {
@@ -1209,8 +1530,26 @@ function Section:AddKeybind(options)
             and input.UserInputType == Enum.UserInputType.Keyboard
             and input.KeyCode == value
             or (mouseButtonNames[value] ~= nil and input.UserInputType == value)
-        if not processed and matches then
-            safeCall(options.Callback, value)
+        if (not processed or options.AllowProcessed == true) and matches then
+            if mode == "toggle" then
+                active = not active
+                safeCall(options.Callback, active, value)
+            elseif mode == "hold" then
+                if not active then active = true; safeCall(options.Callback, true, value) end
+            else
+                safeCall(options.Callback, value)
+            end
+        end
+    end, self.Window._connections)
+    connect(UserInputService.InputEnded, function(input)
+        if mode ~= "hold" or not active then return end
+        local matches = value.EnumType == Enum.KeyCode
+            and input.UserInputType == Enum.UserInputType.Keyboard
+            and input.KeyCode == value
+            or (mouseButtonNames[value] ~= nil and input.UserInputType == value)
+        if matches then
+            active = false
+            safeCall(options.Callback, false, value)
         end
     end, self.Window._connections)
     registerFlagSetter(self.Window, options.Flag, set)
@@ -1219,6 +1558,16 @@ function Section:AddKeybind(options)
         Instance = holder,
         Set = function(_, nextValue, silent) set(nextValue, silent) end,
         Get = function() return value end,
+        IsActive = function() return active end,
+        SetMode = function(_, nextMode)
+            nextMode = string.lower(tostring(nextMode))
+            if nextMode == "press" or nextMode == "hold" or nextMode == "toggle" then
+                mode = nextMode
+                active = false
+                return true
+            end
+            return false
+        end,
     }
 end
 
@@ -1242,7 +1591,7 @@ function Section:AddColorPicker(options)
     local panel = new("Frame", {
         Visible = false,
         Position = UDim2.fromOffset(10, 44),
-        Size = UDim2.new(1, -20, 0, 140),
+        Size = UDim2.new(1, -20, 0, 186),
         BackgroundTransparency = 0,
         BorderSizePixel = 0,
         ZIndex = 3,
@@ -1254,12 +1603,16 @@ function Section:AddColorPicker(options)
     local labels = { "R", "G", "B" }
     local boxes = {}
     local value = options.Default or Color3.new(1, 1, 1)
+    local defaultColor = value
+    local alpha = math.clamp(tonumber(options.DefaultAlpha) or 1, 0, 1)
+    local hexBox
+    local hue, saturation, brightness = value:ToHSV()
     local open = false
 
     local function setOpen(nextOpen)
         open = not not nextOpen
         panel.Visible = open
-        holder.Size = UDim2.new(1, 0, 0, open and 192 or 44)
+        holder.Size = UDim2.new(1, 0, 0, open and 238 or 44)
     end
 
     local closePicker = new("TextButton", {
@@ -1282,6 +1635,7 @@ function Section:AddColorPicker(options)
     local function set(nextValue, silent)
         if typeof(nextValue) ~= "Color3" then return end
         value = nextValue
+        hue, saturation, brightness = value:ToHSV()
         preview.BackgroundColor3 = value
         local rgb = {
             math.floor(value.R * 255 + 0.5),
@@ -1289,18 +1643,21 @@ function Section:AddColorPicker(options)
             math.floor(value.B * 255 + 0.5),
         }
         for index, box in ipairs(boxes) do box.Text = tostring(rgb[index]) end
+        if hexBox then
+            hexBox.Text = string.format("#%02X%02X%02X", rgb[1], rgb[2], rgb[3])
+        end
         if options.Flag then Library.Flags[options.Flag] = value end
-        if not silent then safeCall(options.Callback, value) end
+        if not silent then safeCall(options.Callback, value, alpha) end
     end
     for index, channel in ipairs(labels) do
         text(panel, channel, 11, "MutedText", {
-            Position = UDim2.fromOffset(0, 24 + (index - 1) * 32),
-            Size = UDim2.fromOffset(18, 26),
+            Position = UDim2.new((index - 1) / 3, 0, 0, 24),
+            Size = UDim2.new(1 / 3, -4, 0, 18),
             ZIndex = 4,
         })
         local box = new("TextBox", {
-            Position = UDim2.fromOffset(24, 24 + (index - 1) * 32),
-            Size = UDim2.new(1, -24, 0, 25),
+            Position = UDim2.new((index - 1) / 3, 0, 0, 42),
+            Size = UDim2.new(1 / 3, -5, 0, 25),
             BackgroundColor3 = Library.Theme.SurfaceAlt,
             BorderSizePixel = 0,
             ClearTextOnFocus = false,
@@ -1323,6 +1680,129 @@ function Section:AddColorPicker(options)
             set(Color3.fromRGB(rgb[1], rgb[2], rgb[3]))
         end, self.Window._connections)
     end
+    local sv = new("TextButton", {
+        Position = UDim2.fromOffset(0, 76),
+        Size = UDim2.new(1, -42, 0, 72),
+        BackgroundColor3 = Color3.fromHSV(hue, 1, 1),
+        BorderSizePixel = 0,
+        Text = "",
+        AutoButtonColor = false,
+        ZIndex = 4,
+        Parent = panel,
+    })
+    corner(sv, 4)
+    new("UIGradient", {
+        Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromHSV(hue, 1, 1)),
+        Transparency = NumberSequence.new(0),
+        Parent = sv,
+    })
+    local dark = new("Frame", {
+        BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0,
+        Size = UDim2.fromScale(1, 1), ZIndex = 5, Parent = sv,
+    })
+    new("UIGradient", {
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(1, 0),
+        }),
+        Rotation = 90, Parent = dark,
+    })
+    corner(dark, 4)
+    local hueBar = new("TextButton", {
+        Position = UDim2.new(1, -32, 0, 76), Size = UDim2.fromOffset(32, 72),
+        BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
+        Text = "", AutoButtonColor = false, ZIndex = 4, Parent = panel,
+    })
+    new("UIGradient", {
+        Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.fromHSV(0, 1, 1)),
+            ColorSequenceKeypoint.new(0.17, Color3.fromHSV(0.17, 1, 1)),
+            ColorSequenceKeypoint.new(0.33, Color3.fromHSV(0.33, 1, 1)),
+            ColorSequenceKeypoint.new(0.5, Color3.fromHSV(0.5, 1, 1)),
+            ColorSequenceKeypoint.new(0.67, Color3.fromHSV(0.67, 1, 1)),
+            ColorSequenceKeypoint.new(0.83, Color3.fromHSV(0.83, 1, 1)),
+            ColorSequenceKeypoint.new(1, Color3.fromHSV(1, 1, 1)),
+        }),
+        Rotation = 90, Parent = hueBar,
+    })
+    corner(hueBar, 4)
+    local function inputHSV(target, input)
+        local relative = Vector2.new(input.Position.X, input.Position.Y) - target.AbsolutePosition
+        if target == hueBar then
+            hue = math.clamp(relative.Y / math.max(1, target.AbsoluteSize.Y), 0, 1)
+        else
+            saturation = math.clamp(relative.X / math.max(1, target.AbsoluteSize.X), 0, 1)
+            brightness = 1 - math.clamp(relative.Y / math.max(1, target.AbsoluteSize.Y), 0, 1)
+        end
+        sv.BackgroundColor3 = Color3.fromHSV(hue, 1, 1)
+        set(Color3.fromHSV(hue, saturation, brightness))
+    end
+    local hsvDragTarget
+    connect(sv.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            hsvDragTarget = sv; inputHSV(sv, input)
+        end
+    end, self.Window._connections)
+    connect(hueBar.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            hsvDragTarget = hueBar; inputHSV(hueBar, input)
+        end
+    end, self.Window._connections)
+    connect(UserInputService.InputChanged, function(input)
+        if hsvDragTarget and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            inputHSV(hsvDragTarget, input)
+        end
+    end, self.Window._connections)
+    connect(UserInputService.InputEnded, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then hsvDragTarget = nil end
+    end, self.Window._connections)
+    hexBox = new("TextBox", {
+        Position = UDim2.new(0, 0, 1, -26),
+        Size = options.Alpha == true and UDim2.new(0.5, -4, 0, 24) or UDim2.new(1, -80, 0, 24),
+        BackgroundColor3 = Library.Theme.SurfaceAlt, BorderSizePixel = 0,
+        ClearTextOnFocus = false, Font = Enum.Font.Code, TextColor3 = Library.Theme.Text,
+        TextSize = 11, ZIndex = 4, Parent = panel,
+    })
+    corner(hexBox, 4)
+    bindTheme(hexBox, "BackgroundColor3", "SurfaceAlt")
+    bindTheme(hexBox, "TextColor3", "Text")
+    local alphaBox
+    if options.Alpha == true then
+        alphaBox = new("TextBox", {
+            Position = UDim2.new(0.5, 4, 1, -26), Size = UDim2.new(0.5, -84, 0, 24),
+            BackgroundColor3 = Library.Theme.SurfaceAlt, BorderSizePixel = 0,
+            ClearTextOnFocus = false, Font = Enum.Font.Code, TextColor3 = Library.Theme.Text,
+            Text = tostring(math.floor(alpha * 100 + 0.5)) .. "%", PlaceholderText = "Alpha",
+            TextSize = 10, ZIndex = 4, Parent = panel,
+        })
+        corner(alphaBox, 4)
+        bindTheme(alphaBox, "BackgroundColor3", "SurfaceAlt")
+        bindTheme(alphaBox, "TextColor3", "Text")
+        connect(alphaBox.FocusLost, function()
+            alpha = math.clamp((tonumber(alphaBox.Text:gsub("%%", "")) or (alpha * 100)) / 100, 0, 1)
+            alphaBox.Text = tostring(math.floor(alpha * 100 + 0.5)) .. "%"
+            safeCall(options.Callback, value, alpha)
+        end, self.Window._connections)
+    end
+    local reset = new("TextButton", {
+        Position = UDim2.new(1, -72, 1, -26), Size = UDim2.fromOffset(72, 24),
+        BackgroundColor3 = Library.Theme.SurfaceAlt, BorderSizePixel = 0,
+        Text = "Reset", TextColor3 = Library.Theme.MutedText, Font = Enum.Font.GothamMedium,
+        TextSize = 10, ZIndex = 4, Parent = panel,
+    })
+    corner(reset, 4)
+    bindTheme(reset, "BackgroundColor3", "SurfaceAlt")
+    bindTheme(reset, "TextColor3", "MutedText")
+    connect(hexBox.FocusLost, function()
+        local raw = hexBox.Text:gsub("#", "")
+        if raw:match("^%x%x%x%x%x%x$") then
+            set(Color3.fromRGB(tonumber(raw:sub(1, 2), 16), tonumber(raw:sub(3, 4), 16), tonumber(raw:sub(5, 6), 16)))
+        else
+            set(value, true)
+        end
+    end, self.Window._connections)
+    connect(reset.Activated, function() set(defaultColor) end, self.Window._connections)
     connect(preview.Activated, function()
         setOpen(not open)
     end, self.Window._connections)
@@ -1335,7 +1815,380 @@ function Section:AddColorPicker(options)
         Instance = holder,
         Set = function(_, nextValue, silent) set(nextValue, silent) end,
         Get = function() return value end,
+        GetHSV = function() return hue, saturation, brightness end,
+        SetHSV = function(_, h, s, v, silent)
+            set(Color3.fromHSV(math.clamp(h, 0, 1), math.clamp(s, 0, 1), math.clamp(v, 0, 1)), silent)
+        end,
+        GetAlpha = function() return alpha end,
+        SetAlpha = function(_, nextAlpha, silent)
+            alpha = math.clamp(tonumber(nextAlpha) or alpha, 0, 1)
+            if alphaBox then alphaBox.Text = tostring(math.floor(alpha * 100 + 0.5)) .. "%" end
+            if not silent then safeCall(options.Callback, value, alpha) end
+        end,
+        Reset = function() set(defaultColor) end,
     }
+end
+
+function Section:AddDivider(options)
+    options = type(options) == "table" and options or { Text = options }
+    local holder = new("Frame", {
+        Name = options.Text or "Divider",
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, options.Text and 28 or 17),
+        Parent = self.Container,
+    })
+    local line = new("Frame", {
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = UDim2.new(0, 0, 0.5, 0),
+        Size = UDim2.new(1, 0, 0, 1),
+        BorderSizePixel = 0,
+        Parent = holder,
+    })
+    bindTheme(line, "BackgroundColor3", "Border")
+    if options.Text then
+        local caption = text(holder, options.Text, 10, "MutedText", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(0.5, 0.5),
+            Size = UDim2.fromOffset(math.max(70, #tostring(options.Text) * 7 + 18), 20),
+            TextXAlignment = Enum.TextXAlignment.Center,
+        })
+        bindTheme(caption, "BackgroundColor3", "Background")
+        caption.BackgroundTransparency = 0
+    end
+    return { Instance = holder }
+end
+
+function Section:AddNumberInput(options)
+    options = options or {}
+    local minimum = tonumber(options.Min) or -math.huge
+    local maximum = tonumber(options.Max) or math.huge
+    if minimum > maximum then minimum, maximum = maximum, minimum end
+    local increment = math.abs(tonumber(options.Increment) or 1)
+    if increment == 0 or increment ~= increment then increment = 1 end
+    local callback = options.Callback
+    local mapped = copyTable(options)
+    mapped.Numeric = true
+    mapped.Default = math.clamp(tonumber(options.Default) or 0, minimum, maximum)
+    mapped.Callback = function(raw, enterPressed)
+        local number = tonumber(raw)
+        if not number or number ~= number then return end
+        number = math.clamp(math.floor(number / increment + 0.5) * increment, minimum, maximum)
+        if options.Flag then Library.Flags[options.Flag] = number end
+        safeCall(callback, number, enterPressed)
+    end
+    local input = self:AddInput(mapped)
+    local originalSet = input.Set
+    function input:Set(value, silent)
+        local number = tonumber(value)
+        if not number or number ~= number then return self end
+        number = math.clamp(math.floor(number / increment + 0.5) * increment, minimum, maximum)
+        originalSet(self, tostring(number), silent)
+        if options.Flag then Library.Flags[options.Flag] = number end
+        return self
+    end
+    local originalGet = input.Get
+    function input:Get()
+        return tonumber(originalGet(self))
+    end
+    local box = input.Instance and input.Instance:FindFirstChildWhichIsA("TextBox")
+    if box then
+        connect(box.FocusLost, function()
+            input:Set(box.Text, true)
+        end, self.Window._connections)
+    end
+    input:Set(tonumber(options.Default) or 0, true)
+    return input
+end
+
+function Section:AddRadio(options)
+    options = options or {}
+    local mapped = copyTable(options)
+    mapped.Multi = false
+    return self:AddDropdown(mapped)
+end
+
+function Section:AddSegmented(options)
+    options = options or {}
+    local values = type(options.Values) == "table" and options.Values or {}
+    local holder, nameLabel = createControlBase(self, options.Description and 78 or 66, options.Name or "Segmented", options.Description)
+    nameLabel.Size = UDim2.new(1, -24, 0, 18)
+    local row = new("Frame", {
+        BackgroundTransparency = 1,
+        Position = UDim2.new(0, 10, 1, -32),
+        Size = UDim2.new(1, -20, 0, 24),
+        Parent = holder,
+    })
+    new("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        HorizontalAlignment = Enum.HorizontalAlignment.Center,
+        Padding = UDim.new(0, 5),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Parent = row,
+    })
+    local value = options.Default or values[1]
+    local buttons = {}
+    local disabled = false
+    local function render()
+        for item, button in pairs(buttons) do
+            button.BackgroundTransparency = item == value and 0.05 or 0.72
+            button.TextColor3 = item == value and Library.Theme.Text or Library.Theme.MutedText
+        end
+    end
+    local function set(nextValue, silent)
+        if not table.find(values, nextValue) then return end
+        value = nextValue
+        if options.Flag then Library.Flags[options.Flag] = value end
+        render()
+        if not silent then safeCall(options.Callback, value) end
+    end
+    for _, item in ipairs(values) do
+        local button = new("TextButton", {
+            BackgroundColor3 = Library.Theme.Accent,
+            BorderSizePixel = 0,
+            Size = UDim2.new(1 / math.max(1, #values), -5, 1, 0),
+            AutoButtonColor = false,
+            Font = Enum.Font.GothamMedium,
+            Text = tostring(item),
+            TextSize = 10,
+            Parent = row,
+        })
+        corner(button, 5)
+        buttons[item] = button
+        connect(button.Activated, function() if not disabled then set(item) end end, self.Window._connections)
+    end
+    bindThemeState(holder, render)
+    registerFlagSetter(self.Window, options.Flag, set)
+    set(value, true)
+    return {
+        Instance = holder,
+        Set = function(_, nextValue, silent) set(nextValue, silent) end,
+        Get = function() return value end,
+        SetDisabled = function(_, nextDisabled)
+            disabled = not not nextDisabled
+            for _, button in pairs(buttons) do button.Active = not disabled end
+        end,
+    }
+end
+
+function Section:AddRangeSlider(options)
+    options = options or {}
+    local minimum = tonumber(options.Min) or 0
+    local maximum = tonumber(options.Max) or 100
+    local default = type(options.Default) == "table" and options.Default or { minimum, maximum }
+    local holder = new("Frame", {
+        Name = options.Name or "RangeSlider",
+        BackgroundTransparency = 1,
+        AutomaticSize = Enum.AutomaticSize.Y,
+        Size = UDim2.new(1, 0, 0, 0),
+        Parent = self.Container,
+    })
+    new("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder, Parent = holder })
+    local nested = { Container = holder, Window = self.Window }
+    local low, high
+    local function publish(silent)
+        local result = { low:Get(), high:Get() }
+        if options.Flag then Library.Flags[options.Flag] = result end
+        if not silent then safeCall(options.Callback, result[1], result[2], result) end
+    end
+    local base = {
+        Min = minimum, Max = maximum, Increment = options.Increment, Suffix = options.Suffix,
+    }
+    low = Section.AddSlider(nested, {
+        Name = (options.Name or "Range") .. " minimum",
+        Min = base.Min, Max = base.Max, Increment = base.Increment, Suffix = base.Suffix,
+        Default = default[1] or minimum,
+        Callback = function(value)
+            if high and value > high:Get() then high:Set(value, true) end
+            publish(false)
+        end,
+    })
+    high = Section.AddSlider(nested, {
+        Name = (options.Name or "Range") .. " maximum",
+        Min = base.Min, Max = base.Max, Increment = base.Increment, Suffix = base.Suffix,
+        Default = default[2] or maximum,
+        Callback = function(value)
+            if low and value < low:Get() then low:Set(value, true) end
+            publish(false)
+        end,
+    })
+    local function set(nextValue, silent)
+        if type(nextValue) ~= "table" then return end
+        local a = math.clamp(tonumber(nextValue[1]) or minimum, minimum, maximum)
+        local b = math.clamp(tonumber(nextValue[2]) or maximum, minimum, maximum)
+        if a > b then a, b = b, a end
+        low:Set(a, true); high:Set(b, true); publish(silent)
+    end
+    registerFlagSetter(self.Window, options.Flag, set)
+    set(default, true)
+    return {
+        Instance = holder,
+        Set = function(_, nextValue, silent) set(nextValue, silent) end,
+        Get = function() return { low:Get(), high:Get() } end,
+        SetDisabled = function(_, disabled) low:SetDisabled(disabled); high:SetDisabled(disabled) end,
+    }
+end
+
+-- Shared v2 control contract. Wrapping the original constructors keeps every v1
+-- return value and behavior intact while making lifecycle methods consistent.
+local function enrichControl(control, section, options, ownedConnections)
+    if type(control) ~= "table" or not control.Instance then return control end
+    options = type(options) == "table" and options or {}
+    local instance = control.Instance
+    local destroyed = false
+    local flag = options.Flag
+    local setter = flag and section.Window._flagSetters[flag]
+    for _, descendant in ipairs(instance:GetDescendants()) do
+        if descendant:IsA("GuiButton") then
+            descendant.Selectable = true
+            connect(descendant.SelectionGained, function()
+                if instance and instance.Parent then tween(instance, 0.12, { BackgroundTransparency = 0.58 }) end
+            end, section.Window._connections)
+            connect(descendant.SelectionLost, function()
+                if instance and instance.Parent then tween(instance, 0.12, { BackgroundTransparency = Library.Theme.ControlTransparency or 0.8 }) end
+            end, section.Window._connections)
+        end
+    end
+    for _, methodName in ipairs({ "Set", "Get", "Fire", "Refresh", "SetValues", "Search", "SetOpen" }) do
+        local original = control[methodName]
+        if type(original) == "function" then
+            control[methodName] = function(self, ...)
+                if destroyed then return nil end
+                if self.Disabled and (methodName == "Fire" or methodName == "SetOpen") then return nil end
+                return original(self, ...)
+            end
+        end
+    end
+
+    if options.Tooltip and instance:IsA("GuiObject") then
+        local tooltip
+        local function hideTooltip()
+            if tooltip then tooltip:Destroy(); tooltip = nil end
+        end
+        connect(instance.MouseEnter, function()
+            if destroyed or tooltip then return end
+            tooltip = new("TextLabel", {
+                Name = "Tooltip",
+                BackgroundColor3 = Library.Theme.Surface,
+                BackgroundTransparency = 0.02,
+                BorderSizePixel = 0,
+                AutomaticSize = Enum.AutomaticSize.XY,
+                Text = tostring(options.Tooltip),
+                TextColor3 = Library.Theme.Text,
+                TextSize = 11,
+                Font = Enum.Font.Gotham,
+                TextWrapped = true,
+                Size = UDim2.fromOffset(180, 0),
+                ZIndex = 200,
+                Parent = ScreenGui,
+            })
+            padding(tooltip, 7, 9, 7, 9); corner(tooltip, 5)
+            local mouse = UserInputService:GetMouseLocation()
+            tooltip.Position = UDim2.fromOffset(mouse.X + 12, mouse.Y + 12)
+        end, section.Window._connections)
+        connect(instance.MouseLeave, hideTooltip, section.Window._connections)
+    end
+
+    local function findNameLabel()
+        if not instance or not instance.Parent then return nil end
+        for _, child in ipairs(instance:GetChildren()) do
+            if child:IsA("TextLabel") then return child end
+        end
+    end
+
+    if not control.SetVisible then
+        function control:SetVisible(visible)
+            if destroyed or not instance then return self end
+            instance.Visible = not not visible
+            return self
+        end
+    end
+    if not control.SetDisabled then
+        function control:SetDisabled(disabled)
+            if destroyed or not instance then return self end
+            disabled = not not disabled
+            self.Disabled = disabled
+            instance:SetAttribute("BloodshotDisabled", disabled)
+            for _, descendant in ipairs(instance:GetDescendants()) do
+                if descendant:IsA("GuiButton") or descendant:IsA("TextBox") then
+                    descendant.Active = not disabled
+                    descendant.Selectable = not disabled
+                end
+            end
+            return self
+        end
+    end
+    if not control.SetName then
+        function control:SetName(name)
+            if destroyed or not instance then return self end
+            local label = findNameLabel()
+            if label then label.Text = tostring(name) end
+            instance.Name = tostring(name)
+            return self
+        end
+    end
+    if not control.SetDescription then
+        function control:SetDescription(description)
+            if destroyed or not instance then return self end
+            local labels = {}
+            for _, child in ipairs(instance:GetChildren()) do
+                if child:IsA("TextLabel") then table.insert(labels, child) end
+            end
+            local body = instance:GetAttribute("BloodshotHasDescription") and labels[2] or nil
+            if body then
+                body.Text = tostring(description or "")
+            elseif description ~= nil and instance:GetAttribute("BloodshotControl") and labels[1] then
+                labels[1].Position = UDim2.fromOffset(12, 6)
+                labels[1].Size = UDim2.new(labels[1].Size.X.Scale, labels[1].Size.X.Offset, 0, 18)
+                body = text(instance, tostring(description), 11, "MutedText", {
+                    Position = UDim2.fromOffset(12, 25),
+                    Size = UDim2.new(1, -24, 0, 16),
+                })
+                instance:SetAttribute("BloodshotHasDescription", true)
+                instance.Size = UDim2.new(instance.Size.X.Scale, instance.Size.X.Offset, 0, instance.Size.Y.Offset + 12)
+            end
+            return self
+        end
+    end
+    if not control.Destroy then
+        function control:Destroy()
+            if destroyed then return end
+            destroyed = true
+            for _, connection in ipairs(ownedConnections or {}) do
+                if connection.Connected then connection:Disconnect() end
+            end
+            if flag and Library._flagSetters[flag] == setter then
+                Library._flagSetters[flag] = nil
+                section.Window._flagSetters[flag] = nil
+                Library._flagTypes[flag] = nil
+            end
+            if instance then instance:Destroy(); instance = nil end
+            self.Instance = nil
+        end
+    end
+    if flag and control.Get then
+        local ok, value = pcall(control.Get, control)
+        if ok then Library._flagTypes[flag] = typeof(value) end
+    end
+    return control
+end
+
+for _, methodName in ipairs({
+    "AddLabel", "AddParagraph", "AddButton", "AddToggle", "AddSlider",
+    "AddInput", "AddDropdown", "AddKeybind", "AddColorPicker", "AddDivider",
+    "AddNumberInput", "AddRadio", "AddSegmented", "AddRangeSlider",
+}) do
+    local original = Section[methodName]
+    Section[methodName] = function(self, options)
+        local firstConnection = #self.Window._connections + 1
+        local control = original(self, options)
+        local ownedConnections = {}
+        for index = firstConnection, #self.Window._connections do
+            table.insert(ownedConnections, self.Window._connections[index])
+        end
+        control = enrichControl(control, self, options, ownedConnections)
+        if self.Controls and not table.find(self.Controls, control) then table.insert(self.Controls, control) end
+        return control
+    end
 end
 
 local Tab = {}
@@ -1369,11 +2222,136 @@ function Tab:AddSection(options)
         Parent = container,
     })
     local section = setmetatable({
+        Name = options.Name or "Section",
         Frame = sectionFrame,
+        Heading = heading,
         Container = container,
         Window = self.Window,
+        Tab = self,
+        Collapsed = false,
+        Disabled = false,
+        Controls = {},
     }, Section)
+    table.insert(self.Sections, section)
+    if options.Collapsible == true then
+        local collapseButton = new("TextButton", {
+            BackgroundTransparency = 1,
+            Size = UDim2.new(1, 0, 0, 24),
+            Text = "",
+            AutoButtonColor = false,
+            Parent = sectionFrame,
+        })
+        connect(collapseButton.Activated, function()
+            section:ToggleCollapsed()
+            heading.Text = (section.Collapsed and "+ " or "- ") .. string.upper(section.Name)
+        end, self.Window._connections)
+        section.CollapseButton = collapseButton
+        if options.Collapsed == true then section:SetCollapsed(true); heading.Text = "+ " .. string.upper(section.Name) end
+    end
     return section
+end
+
+function Section:SetVisible(visible)
+    if self.Frame then self.Frame.Visible = not not visible end
+    return self
+end
+
+function Section:SetDisabled(disabled)
+    self.Disabled = not not disabled
+    if self.Container then
+        for _, descendant in ipairs(self.Container:GetDescendants()) do
+            if descendant:IsA("GuiButton") or descendant:IsA("TextBox") then
+                descendant.Active = not self.Disabled
+                descendant.Selectable = not self.Disabled
+            end
+        end
+    end
+    return self
+end
+
+function Section:SetCollapsed(collapsed)
+    self.Collapsed = not not collapsed
+    if self.Container then self.Container.Visible = not self.Collapsed end
+    return self
+end
+
+function Section:ToggleCollapsed()
+    return self:SetCollapsed(not self.Collapsed)
+end
+
+function Section:Destroy()
+    if not self.Frame then return end
+    for index = #self.Controls, 1, -1 do
+        local control = self.Controls[index]
+        if control and control.Destroy then control:Destroy() end
+    end
+    table.clear(self.Controls)
+    if self.Tab then
+        local index = table.find(self.Tab.Sections, self)
+        if index then table.remove(self.Tab.Sections, index) end
+    end
+    self.Frame:Destroy()
+    self.Frame = nil
+    self.Container = nil
+end
+
+function Tab:SetVisible(visible)
+    visible = not not visible
+    self.Button.Visible = visible
+    if not visible and self.Window.ActiveTab == self then
+        for _, candidate in ipairs(self.Window.Tabs) do
+            if candidate ~= self and candidate.Button.Visible then
+                self.Window:SelectTab(candidate)
+                break
+            end
+        end
+    end
+    return self
+end
+
+function Tab:SetDisabled(disabled)
+    self.Disabled = not not disabled
+    self.Button.Active = not self.Disabled
+    self.Button.Selectable = not self.Disabled
+    self.Button.TextTransparency = self.Disabled and 0.6 or 0
+    return self
+end
+
+function Tab:Search(query)
+    query = string.lower(tostring(query or ""))
+    local visibleCount = 0
+    for _, section in ipairs(self.Sections) do
+        local sectionMatch = string.find(string.lower(section.Name), query, 1, true) ~= nil
+        local sectionVisible = sectionMatch or query == ""
+        for _, control in ipairs(section.Container:GetChildren()) do
+            if control:IsA("GuiObject") then
+                local name = string.lower(control.Name)
+                local matches = query == "" or sectionMatch or string.find(name, query, 1, true) ~= nil
+                control.Visible = matches
+                sectionVisible = sectionVisible or matches
+            end
+        end
+        section.Frame.Visible = sectionVisible
+        if sectionVisible then visibleCount += 1 end
+    end
+    return visibleCount
+end
+
+function Tab:Destroy()
+    if not self.Button then return end
+    local window = self.Window
+    for index = #self.Sections, 1, -1 do self.Sections[index]:Destroy() end
+    if window.ActiveTab == self then window.ActiveTab = nil end
+    window._tabByName[self.Name] = nil
+    local index = table.find(window.Tabs, self)
+    if index then table.remove(window.Tabs, index) end
+    self.Button:Destroy()
+    self.Page:Destroy()
+    self.Button = nil
+    self.Page = nil
+    for _, candidate in ipairs(window.Tabs) do
+        if candidate.Button and candidate.Button.Visible then window:SelectTab(candidate); break end
+    end
 end
 
 local Window = {}
@@ -1395,6 +2373,51 @@ function Window:SetVisible(visible)
             if not self.Visible and self.Root then self.Root.Visible = false end
         end)
     end
+end
+
+function Window:GetTab(name)
+    return self._tabByName[tostring(name)]
+end
+
+function Window:SetPosition(position)
+    if self._destroyed or typeof(position) ~= "UDim2" then return false end
+    self.Root.Position = position
+    self:_ClampToViewport()
+    return true
+end
+
+function Window:SetSize(size)
+    if self._destroyed or typeof(size) ~= "UDim2" then return false end
+    local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.zero
+    local width = math.max(self._minimumSize.X, viewport.X * size.X.Scale + size.X.Offset)
+    local height = math.max(self._minimumSize.Y, viewport.Y * size.Y.Scale + size.Y.Offset)
+    self._size = UDim2.fromOffset(width, height)
+    if not self.Minimized then self.Root.Size = self._size end
+    self:_ClampToViewport()
+    return true
+end
+
+function Window:SetToggleKey(input)
+    if typeof(input) ~= "EnumItem" then return false, "Toggle key must be an EnumItem" end
+    self._toggleKey = input
+    return true
+end
+
+function Window:SetTitle(title, subtitle)
+    if self._titleLabel then self._titleLabel.Text = tostring(title or "") end
+    if subtitle ~= nil and self._subtitleLabel then self._subtitleLabel.Text = tostring(subtitle) end
+    return self
+end
+
+function Window:_ClampToViewport()
+    if self._destroyed or not self.Root then return end
+    local camera = workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize
+    if not viewport or viewport.X <= 0 or viewport.Y <= 0 then return end
+    local size = self.Root.AbsoluteSize
+    local centerX = math.clamp(self.Root.AbsolutePosition.X + size.X / 2, math.min(size.X / 2, viewport.X / 2), math.max(viewport.X - size.X / 2, viewport.X / 2))
+    local centerY = math.clamp(self.Root.AbsolutePosition.Y + size.Y / 2, math.min(size.Y / 2, viewport.Y / 2), math.max(viewport.Y - size.Y / 2, viewport.Y / 2))
+    self.Root.Position = UDim2.fromOffset(centerX, centerY)
 end
 
 function Window:Toggle()
@@ -1453,7 +2476,7 @@ function Window:SetMinimized(minimized)
     end
 
     if self.MinimizeButton then
-        self.MinimizeButton.Text = minimized and "+" or "—"
+        self.MinimizeButton.Text = minimized and "+" or "-"
     end
 end
 
@@ -1465,7 +2488,7 @@ function Window:SelectTab(tab)
     if type(tab) == "string" then
         tab = self._tabByName[tab]
     end
-    if not tab or self.ActiveTab == tab then return end
+    if not tab or tab.Disabled or self.ActiveTab == tab then return end
     if self.ActiveTab then
         self.ActiveTab.Page.Visible = false
         tween(self.ActiveTab.Button, 0.15, {
@@ -1577,6 +2600,8 @@ function Window:AddTab(name, icon)
         Indicator = indicator,
         Page = page,
         Window = self,
+        Sections = {},
+        Disabled = false,
     }, Tab)
     bindThemeState(button, function()
         button.BackgroundColor3 = Library.Theme.SurfaceAlt
@@ -1648,6 +2673,11 @@ end
 function Library:CreateWindow(options)
     options = options or {}
     local size = options.Size or UDim2.fromOffset(680, 470)
+    if typeof(size) ~= "UDim2"
+        or (size.X.Scale == 0 and size.X.Offset <= 0)
+        or (size.Y.Scale == 0 and size.Y.Offset <= 0) then
+        size = UDim2.fromOffset(680, 470)
+    end
     local sidebarWidth = math.clamp(tonumber(options.SidebarWidth) or 158, 110, 280)
     local sidebarHeight = math.clamp(tonumber(options.SidebarHeight) or 72, 52, 130)
     local topbarHeight = math.clamp(tonumber(options.TopbarHeight) or 58, 44, 96)
@@ -1666,6 +2696,10 @@ function Library:CreateWindow(options)
     local minimumSize = typeof(options.MinimumSize) == "Vector2"
         and options.MinimumSize
         or Vector2.new(520, 360)
+    minimumSize = Vector2.new(
+        math.clamp(minimumSize.X, 240, 4096),
+        math.clamp(minimumSize.Y, 180, 2160)
+    )
     local minimizedWidth = math.clamp(tonumber(options.MinimizedWidth) or 320, 220, 480)
     local connections = {}
     local root = new("Frame", {
@@ -1892,12 +2926,12 @@ function Library:CreateWindow(options)
         Parent = root,
     })
     local titleTop = math.max(4, (topbarHeight - 40) * 0.5)
-    text(topbar, options.Title or "Bloodshot", 17, "Text", {
+    local titleLabel = text(topbar, options.Title or "Bloodshot", 17, "Text", {
         Position = UDim2.fromOffset(18, titleTop),
         Size = UDim2.new(1, -140, 0, 22),
         Font = Enum.Font.GothamBold,
     })
-    text(topbar, options.Subtitle or ("UI Library · " .. self.Version), 10, "MutedText", {
+    local subtitleLabel = text(topbar, options.Subtitle or ("UI Library - " .. self.Version), 10, "MutedText", {
         Position = UDim2.fromOffset(18, titleTop + 22),
         Size = UDim2.new(1, -140, 0, 16),
     })
@@ -1910,7 +2944,7 @@ function Library:CreateWindow(options)
         BorderSizePixel = 0,
         AutoButtonColor = false,
         Font = Enum.Font.GothamMedium,
-        Text = "×",
+        Text = "X",
         TextColor3 = Library.Theme.MutedText,
         TextSize = 20,
         Parent = topbar,
@@ -1929,7 +2963,7 @@ function Library:CreateWindow(options)
             BorderSizePixel = 0,
             AutoButtonColor = false,
             Font = Enum.Font.GothamMedium,
-            Text = "—",
+            Text = "-",
             TextColor3 = Library.Theme.MutedText,
             TextSize = 18,
             Parent = topbar,
@@ -2061,10 +3095,58 @@ function Library:CreateWindow(options)
         _flagSetters = {},
         _backgroundTweens = backgroundTweens,
         _tabByName = {},
+        _titleLabel = titleLabel,
+        _subtitleLabel = subtitleLabel,
+        _toggleKey = options.ToggleKey or Enum.KeyCode.RightShift,
     }, Window)
     table.insert(self._windows, window)
 
     makeDraggable(topbar, root, connections)
+    connect(topbar.InputEnded, function()
+        window:_ClampToViewport()
+    end, connections)
+    if options.Resizable ~= false then
+        local resizeHandle = new("TextButton", {
+            Name = "ResizeHandle",
+            AnchorPoint = Vector2.new(1, 1),
+            Position = UDim2.fromScale(1, 1),
+            Size = UDim2.fromOffset(22, 22),
+            BackgroundTransparency = 1,
+            AutoButtonColor = false,
+            Text = "//",
+            Font = Enum.Font.Code,
+            TextSize = 11,
+            TextColor3 = Library.Theme.MutedText,
+            ZIndex = 12,
+            Parent = root,
+        })
+        bindTheme(resizeHandle, "TextColor3", "MutedText")
+        local resizing = false
+        local resizeStart
+        local startSize
+        connect(resizeHandle.InputBegan, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                resizing = true
+                resizeStart = input.Position
+                startSize = root.AbsoluteSize
+            end
+        end, connections)
+        connect(UserInputService.InputChanged, function(input)
+            if resizing and (input.UserInputType == Enum.UserInputType.MouseMovement
+                or input.UserInputType == Enum.UserInputType.Touch) then
+                local delta = input.Position - resizeStart
+                window:SetSize(UDim2.fromOffset(startSize.X + delta.X, startSize.Y + delta.Y))
+            end
+        end, connections)
+        connect(UserInputService.InputEnded, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                resizing = false
+            end
+        end, connections)
+        window.ResizeHandle = resizeHandle
+    end
     connect(close.MouseEnter, function()
         tween(close, 0.15, {
             BackgroundTransparency = 0,
@@ -2098,9 +3180,8 @@ function Library:CreateWindow(options)
         end, connections)
     end
 
-    local toggleKey = options.ToggleKey or Enum.KeyCode.RightShift
     connect(UserInputService.InputBegan, function(input, processed)
-        if not processed and input.KeyCode == toggleKey then
+        if not processed and (input.KeyCode == window._toggleKey or input.UserInputType == window._toggleKey) then
             window:Toggle()
         end
     end, connections)
@@ -2120,6 +3201,9 @@ function Library:CreateWindow(options)
     end
     tween(sidebarScale, 0.38, { Scale = 1 }, Enum.EasingStyle.Back)
     tween(windowScale, 0.38, { Scale = 1 }, Enum.EasingStyle.Back)
+    task.defer(function()
+        if not window._destroyed then window:_ClampToViewport() end
+    end)
     return window
 end
 
