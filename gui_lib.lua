@@ -1493,16 +1493,24 @@ local function beginReorderDrag(handle, target, container, window, vertical, thr
             if (input.Position - startPoint).Magnitude < (threshold or 6) then return end
             started = true
         end
+        -- Slot boundaries are the midpoints between neighbouring centres rather
+        -- than the centres themselves, so the row lands under the pointer the
+        -- moment the gap opens instead of half an item late.
         local probe = vertical and input.Position.Y or input.Position.X
-        local best, bestDistance, current = 1, math.huge, 1
+        local centres = {}
+        local current = 1
         for slot, sibling in ipairs(orderedChildren(container)) do
-            if sibling == target then current = slot end
-            local centre = vertical
+            centres[slot] = vertical
                 and (sibling.AbsolutePosition.Y + sibling.AbsoluteSize.Y / 2)
                 or (sibling.AbsolutePosition.X + sibling.AbsoluteSize.X / 2)
-            local distance = math.abs(probe - centre)
-            if distance < bestDistance then
-                best, bestDistance = slot, distance
+            if sibling == target then current = slot end
+        end
+        local best = current
+        for slot = 1, #centres do
+            local boundary = slot < #centres and (centres[slot] + centres[slot + 1]) / 2 or math.huge
+            if probe < boundary then
+                best = slot
+                break
             end
         end
         if best ~= current then
@@ -2359,14 +2367,18 @@ function Section:AddColorPicker(options)
     corner(preview, 5)
     stroke(preview, Color3.new(1, 1, 1), 1, 0.7)
     local panel = new("Frame", {
+        -- Lives on the window root, not inside the control: the row clips its
+        -- own descendants and every later row draws over it, so an in-row panel
+        -- ends up cut off and half hidden behind the controls below.
         Visible = false,
-        Position = UDim2.fromOffset(10, 44),
-        Size = UDim2.new(1, -20, 0, 186),
+        Size = UDim2.fromOffset(280, 186),
         BackgroundTransparency = 0,
         BorderSizePixel = 0,
-        ZIndex = 3,
-        Parent = holder,
+        ZIndex = 60,
+        Parent = self.Window.Root,
     })
+    self._overlays = self._overlays or {}
+    table.insert(self._overlays, panel)
     bindTheme(panel, "BackgroundColor3", "Background")
     corner(panel, 5)
     padding(panel, 10, 10, 10, 10)
@@ -2379,11 +2391,41 @@ function Section:AddColorPicker(options)
     local hue, saturation, brightness = value:ToHSV()
     local open = false
 
+    local PANEL_HEIGHT = 186
+    local function placePanel()
+        if not open then return end
+        local rootFrame = self.Window.Root
+        local rootSize = rootFrame.AbsoluteSize
+        if rootSize.X <= 0 or rootSize.Y <= 0 then return end
+        local width = math.clamp(holder.AbsoluteSize.X - 20, 200, math.max(200, rootSize.X - 16))
+        local x = holder.AbsolutePosition.X - rootFrame.AbsolutePosition.X + 10
+        local y = holder.AbsolutePosition.Y - rootFrame.AbsolutePosition.Y + 44
+        -- Flip above the control when the row sits too low in the page.
+        if y + PANEL_HEIGHT > rootSize.Y - 6 then
+            y = holder.AbsolutePosition.Y - rootFrame.AbsolutePosition.Y - PANEL_HEIGHT
+        end
+        panel.Size = UDim2.fromOffset(width, PANEL_HEIGHT)
+        panel.Position = UDim2.fromOffset(
+            math.clamp(x, 6, math.max(6, rootSize.X - width - 6)),
+            math.clamp(y, 6, math.max(6, rootSize.Y - PANEL_HEIGHT - 6))
+        )
+    end
+
     local function setOpen(nextOpen)
         open = not not nextOpen
         panel.Visible = open
-        holder.Size = UDim2.new(1, 0, 0, open and 238 or 44)
+        if open then placePanel() end
     end
+    -- Stay anchored to the row while the page scrolls or the window resizes.
+    -- Pages is a plain Frame; the ScrollingFrame that moves is the tab's page.
+    local page = self.Tab and self.Tab.Page
+    if page then
+        connect(page:GetPropertyChangedSignal("CanvasPosition"), placePanel, self.Window._connections)
+    end
+    connect(self.Window.Root:GetPropertyChangedSignal("AbsoluteSize"), placePanel, self.Window._connections)
+    connect(self.Window.Pages:GetPropertyChangedSignal("Visible"), function()
+        if not self.Window.Pages.Visible then setOpen(false) end
+    end, self.Window._connections)
 
     local closePicker = new("TextButton", {
         AnchorPoint = Vector2.new(1, 0),
@@ -3116,25 +3158,27 @@ function Tab:AddSection(options)
         section._dragState = beginReorderDrag(sectionFrame, sectionFrame, self.Page, self.Window, true, 6,
             function() self:SyncSectionOrder() end)
     end
-    if options.Collapsible == true then
-        local collapseButton = new("TextButton", {
-            BackgroundTransparency = 1,
-            Size = UDim2.new(1, 0, 0, 24),
-            Text = "",
-            AutoButtonColor = false,
-            Parent = sectionFrame,
-        })
-        connect(collapseButton.Activated, function()
-            if section._dragState and section._dragState.Dragged then
-                section._dragState.Dragged = false
-                return
-            end
-            section:ToggleCollapsed()
-            heading.Text = (section.Collapsed and "+ " or "- ") .. string.upper(section.Name)
-        end, self.Window._connections)
-        section.CollapseButton = collapseButton
-        if options.Collapsed == true then section:SetCollapsed(true); heading.Text = "+ " .. string.upper(section.Name) end
-    end
+    -- Every section gets the toggle, but it only reacts once the section is
+    -- collapsible or already collapsed: a SetCollapsed() from code can always be
+    -- undone by clicking the heading again, and plain sections look untouched.
+    local collapseButton = new("TextButton", {
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, 24),
+        Text = "",
+        AutoButtonColor = false,
+        Active = false,
+        Parent = sectionFrame,
+    })
+    section.Collapsible = options.Collapsible == true
+    connect(collapseButton.Activated, function()
+        if section._dragState and section._dragState.Dragged then
+            section._dragState.Dragged = false
+            return
+        end
+        section:ToggleCollapsed()
+    end, self.Window._connections)
+    section.CollapseButton = collapseButton
+    section:SetCollapsed(options.Collapsed == true)
     return section
 end
 
@@ -3152,6 +3196,14 @@ function Section:SetDisabled(disabled)
                 descendant.Selectable = not self.Disabled
             end
         end
+        for _, overlay in ipairs(self._overlays or {}) do
+            for _, descendant in ipairs(overlay:GetDescendants()) do
+                if descendant:IsA("GuiButton") or descendant:IsA("TextBox") then
+                    descendant.Active = not self.Disabled
+                    descendant.Selectable = not self.Disabled
+                end
+            end
+        end
     end
     return self
 end
@@ -3159,6 +3211,14 @@ end
 function Section:SetCollapsed(collapsed)
     self.Collapsed = not not collapsed
     if self.Container then self.Container.Visible = not self.Collapsed end
+    -- Marker and clickability follow the state, so a collapsed section is never
+    -- a dead end: the heading itself brings it back.
+    local marker = (self.Collapsible or self.Collapsed) and (self.Collapsed and "+ " or "- ") or ""
+    if self.Heading then self.Heading.Text = marker .. string.upper(self.Name) end
+    if self.CollapseButton then
+        self.CollapseButton.Active = self.Collapsible or self.Collapsed
+        self.CollapseButton.Selectable = self.CollapseButton.Active
+    end
     return self
 end
 
@@ -3168,6 +3228,10 @@ end
 
 function Section:Destroy()
     if not self.Frame then return end
+    for _, overlay in ipairs(self._overlays or {}) do
+        if overlay and overlay.Parent then overlay:Destroy() end
+    end
+    self._overlays = nil
     for index = #self.Controls, 1, -1 do
         local control = self.Controls[index]
         if control and control.Destroy then control:Destroy() end
@@ -3206,20 +3270,60 @@ end
 
 function Tab:Search(query)
     query = string.lower(tostring(query or ""))
+    if query == "" then
+        -- Put back exactly what was on screen when the search started; sections
+        -- hidden or rows cleared by hand earlier stay hidden.
+        local snapshot = self._searchSnapshot
+        self._searchSnapshot = nil
+        local visibleCount = 0
+        if snapshot then
+            for _, entry in ipairs(snapshot.sections) do
+                if entry.frame.Parent then entry.frame.Visible = entry.visible end
+            end
+            for _, entry in ipairs(snapshot.controls) do
+                if entry.instance.Parent then entry.instance.Visible = entry.visible end
+            end
+            for _, section in ipairs(self.Sections) do
+                for _, control in ipairs(section.Container:GetChildren()) do
+                    if control:IsA("GuiObject")
+                        and control:GetAttribute("BloodshotDependencyMet") == false then
+                        control.Visible = false
+                    end
+                end
+                if section.Frame.Visible then visibleCount += 1 end
+            end
+        else
+            for _, section in ipairs(self.Sections) do
+                if section.Frame.Visible then visibleCount += 1 end
+            end
+        end
+        return visibleCount
+    end
+
+    if not self._searchSnapshot then
+        local controls = {}
+        local sections = {}
+        for _, section in ipairs(self.Sections) do
+            sections[#sections + 1] = { frame = section.Frame, visible = section.Frame.Visible }
+            for _, control in ipairs(section.Container:GetChildren()) do
+                if control:IsA("GuiObject") then
+                    controls[#controls + 1] = { instance = control, visible = control.Visible }
+                end
+            end
+        end
+        self._searchSnapshot = { controls = controls, sections = sections }
+    end
+
     local visibleCount = 0
     for _, section in ipairs(self.Sections) do
         local sectionMatch = string.find(string.lower(section.Name), query, 1, true) ~= nil
-        local sectionVisible = sectionMatch or query == ""
+        local sectionVisible = sectionMatch
         for _, control in ipairs(section.Container:GetChildren()) do
             if control:IsA("GuiObject") then
-                local name = string.lower(control.Name)
-                local matches = query == "" or sectionMatch or string.find(name, query, 1, true) ~= nil
+                local matches = sectionMatch
+                    or string.find(string.lower(control.Name), query, 1, true) ~= nil
                 local blocked = control:GetAttribute("BloodshotDependencyMet") == false
-                if blocked then
-                    control.Visible = false
-                else
-                    control.Visible = matches
-                end
+                control.Visible = matches and not blocked
                 sectionVisible = sectionVisible or matches
             end
         end
@@ -3391,6 +3495,17 @@ function Window:Toggle()
     self:SetVisible(not self.Visible)
 end
 
+-- The window's intended pixel size, independent of any in-flight scale tween.
+function Window:_TargetSize()
+    local camera = workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize or Vector2.zero
+    local size = self._size or UDim2.fromOffset(0, 0)
+    return Vector2.new(
+        viewport.X * size.X.Scale + size.X.Offset,
+        viewport.Y * size.Y.Scale + size.Y.Offset
+    )
+end
+
 function Window:SetMinimized(minimized)
     if self._destroyed or self._minimizeAnimating then return end
     minimized = not not minimized
@@ -3402,8 +3517,12 @@ function Window:SetMinimized(minimized)
         self.Sidebar.Visible = false
         self.Pages.Visible = false
         self.TopbarSeparator.Visible = false
-        self._minimizeOffsetY = math.max(0, (self.Root.AbsoluteSize.Y - self._topbarHeight) * 0.5)
-        local minimizedWidth = math.min(self.Root.AbsoluteSize.X, self._minimizedWidth)
+        -- Target size resolved from the viewport, not the live AbsoluteSize: a
+        -- window still playing its open tween reports a scaled size and would
+        -- settle off-centre.
+        local target = self:_TargetSize()
+        self._minimizeOffsetY = math.max(0, (target.Y - self._topbarHeight) * 0.5)
+        local minimizedWidth = math.min(target.X, self._minimizedWidth)
         self._sizeConstraint.MinSize = Vector2.new(minimizedWidth, self._topbarHeight)
         local animation = tween(self.Root, 0.24, {
             Position = UDim2.new(
@@ -3420,12 +3539,13 @@ function Window:SetMinimized(minimized)
             end
         end)
     else
+        local restoreOffset = math.max(0, (self:_TargetSize().Y - self._topbarHeight) * 0.5)
         local animation = tween(self.Root, 0.28, {
             Position = UDim2.new(
                 self.Root.Position.X.Scale,
                 self.Root.Position.X.Offset,
                 self.Root.Position.Y.Scale,
-                self.Root.Position.Y.Offset + self._minimizeOffsetY
+                self.Root.Position.Y.Offset + restoreOffset
             ),
             Size = self._size,
         }, Enum.EasingStyle.Back)
@@ -3832,6 +3952,9 @@ function Library:CreateWindow(options)
         BackgroundTransparency = 0,
         BorderSizePixel = 0,
         ClipsDescendants = false,
+        -- A Frame with Active = false never consumes input: every click fell
+        -- through to the window behind it, raising that one instead of this.
+        Active = true,
         Parent = ScreenGui,
     })
     local sizeConstraint = new("UISizeConstraint", {
@@ -4227,7 +4350,9 @@ function Library:CreateWindow(options)
     }, Window)
     table.insert(self._windows, window)
     table.insert(self._windowOrder, window)
-    applyWindowZOrder()
+    -- A new window opens in front, otherwise it lands behind every window that
+    -- already exists and the one you just made looks like it vanished.
+    self:FocusWindow(window, false)
 
     makeDraggable(topbar, root, connections)
     connect(root.InputBegan, function()
