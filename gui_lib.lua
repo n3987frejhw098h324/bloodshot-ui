@@ -1341,6 +1341,51 @@ local function applyWindowZOrder()
     end
 end
 
+-- Front-to-back hit test: which visible window is on top at a screen point.
+-- Used so a click on an overlapping window never focuses or activates the one
+-- underneath, and so hover alone never changes focus.
+function Library:_topWindowAt(position)
+    if typeof(position) ~= "Vector2" then
+        return nil
+    end
+    for _, window in ipairs(self._windowOrder) do
+        if not window._destroyed and window.Visible and window.Root and window.Root.Visible then
+            local ok, absPos, absSize = pcall(function()
+                return window.Root.AbsolutePosition, window.Root.AbsoluteSize
+            end)
+            if ok and absPos and absSize then
+                if position.X >= absPos.X and position.Y >= absPos.Y
+                    and position.X <= absPos.X + absSize.X
+                    and position.Y <= absPos.Y + absSize.Y then
+                    return window
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- True when a click at `position` belongs to a window above `window` and must
+-- be ignored by `window`. Nil position falls back to the current mouse location.
+function Library:_isObscured(window, position)
+    local pos = position
+    if typeof(pos) ~= "Vector2" then
+        local ok, mouse = pcall(function()
+            return UserInputService:GetMouseLocation()
+        end)
+        if ok then
+            pos = mouse
+        else
+            return false
+        end
+    end
+    local top = self:_topWindowAt(pos)
+    if top == nil then
+        return false
+    end
+    return top ~= window
+end
+
 function Library:GetWindows()
     local list = {}
     for _, window in ipairs(self._windows) do
@@ -2096,7 +2141,13 @@ function Section:AddRow(options)
             slot:Destroy()
             return nil
         end
-        compactifyControl(result.Instance, rowHeight)
+        local rowNameLabel = compactifyControl(result.Instance, rowHeight)
+        -- Narrow fixed columns cannot fit both a name and an interactive part
+        -- side by side; hiding the name prevents the two texts overlapping.
+        -- The slot keeps its width so the row layout does not shift.
+        if width and width < 90 and rowNameLabel then
+            rowNameLabel.Visible = false
+        end
         result.Window = window
         -- Section.Add* is the enriched wrapper, so the child already carries the full
         -- control contract. It does not join section.Controls (those are the
@@ -2130,15 +2181,8 @@ function Section:AddRow(options)
             if child then table.insert(children, child) end
         end
     end
-    -- Children were built against throwaway slots; reparent the finished holders
-    -- into one shared slot so weight-based widths apply to the whole row.
-    if #children > 0 then
-        for _, child in ipairs(children) do
-            if child.Instance and child.Instance.Parent then
-                child.Instance.Parent = strip
-            end
-        end
-    end
+    -- Slots stay parented to the strip so fixed pixel widths and weight-based
+    -- shares are preserved; each child holder fills its own slot.
 
     local row = {
         Instance = holder,
@@ -2268,6 +2312,9 @@ function Section:AddButton(options)
         end
     end, self.Window._connections)
     connect(button.Activated, function(input)
+        if Library:_isObscured(self.Window, input and input.Position) then
+            return
+        end
         ripple(holder, input and input.Position)
         tween(buttonScale, 0.08, { Scale = 0.97 }, Enum.EasingStyle.Sine).Completed:Connect(function()
             if holder.Parent then
@@ -2349,7 +2396,10 @@ function Section:AddToggle(options)
     bindThemeState(track, function()
         track.BackgroundColor3 = value and Library.Theme.Accent or Library.Theme.Border
     end)
-    connect(button.Activated, function()
+    connect(button.Activated, function(input)
+        if Library:_isObscured(self.Window, input and input.Position) then
+            return
+        end
         set(not value)
     end, self.Window._connections)
     registerFlagSetter(self.Window, options.Flag, set)
@@ -2444,6 +2494,9 @@ function Section:AddSlider(options)
     end
     connect(hitbox.InputBegan, function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            if Library:_isObscured(self.Window, input.Position) then
+                return
+            end
             dragging = true
             updateFromInput(input)
         end
@@ -2783,7 +2836,10 @@ function Section:AddDropdown(options)
                     TextColor3 = active and Library.Theme.Accent or Library.Theme.MutedText,
                 })
             end, self.Window._connections)
-            connect(option.Activated, function()
+            connect(option.Activated, function(input)
+                if Library:_isObscured(self.Window, input and input.Position) then
+                    return
+                end
                 tween(displayScale, 0.08, { Scale = 0.97 }).Completed:Connect(function()
                     if display.Parent then tween(displayScale, 0.14, { Scale = 1 }, Enum.EasingStyle.Back) end
                 end)
@@ -2807,7 +2863,10 @@ function Section:AddDropdown(options)
         tween(displayScale, 0.14, { Scale = 1 })
         tween(display, 0.14, { BackgroundColor3 = Library.Theme.Background })
     end, self.Window._connections)
-    connect(display.Activated, function()
+    connect(display.Activated, function(input)
+        if Library:_isObscured(self.Window, input and input.Position) then
+            return
+        end
         tween(displayScale, 0.08, { Scale = 0.97 }).Completed:Connect(function()
             if display.Parent then tween(displayScale, 0.14, { Scale = 1 }, Enum.EasingStyle.Back) end
         end)
@@ -2932,7 +2991,10 @@ function Section:AddKeybind(options)
     bindThemeState(keyButton, function()
         keyButton.TextColor3 = listening and Library.Theme.Accent or Library.Theme.MutedText
     end)
-    connect(keyButton.Activated, function()
+    connect(keyButton.Activated, function(input)
+        if Library:_isObscured(self.Window, input and input.Position) then
+            return
+        end
         if ignoreNextActivation then
             ignoreNextActivation = false
             return
@@ -3263,11 +3325,17 @@ function Section:AddColorPicker(options)
     local hsvDragTarget
     connect(sv.InputBegan, function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            if Library:_isObscured(self.Window, input.Position) then
+                return
+            end
             hsvDragTarget = sv; inputHSV(sv, input)
         end
     end, self.Window._connections)
     connect(hueBar.InputBegan, function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            if Library:_isObscured(self.Window, input.Position) then
+                return
+            end
             hsvDragTarget = hueBar; inputHSV(hueBar, input)
         end
     end, self.Window._connections)
@@ -3315,7 +3383,7 @@ function Section:AddColorPicker(options)
             connect(swatch.MouseLeave, function()
                 tween(swatch, 0.12, { BackgroundTransparency = 0 })
             end, self.Window._connections)
-            connect(swatch.Activated, function() set(presets[index]) end, self.Window._connections)
+            connect(swatch.Activated, function(input) if Library:_isObscured(self.Window, input and input.Position) then return end set(presets[index]) end, self.Window._connections)
             presetSwatches[index] = swatch
         end
     end
@@ -3361,7 +3429,7 @@ function Section:AddColorPicker(options)
         corner(reset, 4)
         bindTheme(reset, "BackgroundColor3", "SurfaceAlt")
         bindTheme(reset, "TextColor3", "MutedText")
-        connect(reset.Activated, function() set(defaultColor) end, self.Window._connections)
+        connect(reset.Activated, function(input) if Library:_isObscured(self.Window, input and input.Position) then return end set(defaultColor) end, self.Window._connections)
     end
     connect(hexBox.FocusLost, function()
         local raw = hexBox.Text:gsub("#", "")
@@ -3371,10 +3439,16 @@ function Section:AddColorPicker(options)
             set(value, true)
         end
     end, self.Window._connections)
-    connect(preview.Activated, function()
+    connect(preview.Activated, function(input)
+        if Library:_isObscured(self.Window, input and input.Position) then
+            return
+        end
         setOpen(not open)
     end, self.Window._connections)
-    connect(closePicker.Activated, function()
+    connect(closePicker.Activated, function(input)
+        if Library:_isObscured(self.Window, input and input.Position) then
+            return
+        end
         setOpen(false)
     end, self.Window._connections)
     registerFlagSetter(self.Window, options.Flag, set)
@@ -3517,14 +3591,20 @@ function Section:AddNumberInput(options)
         -- A number needs its affixes visible but must not have them typed into
         -- the box, so they live in their own label beside it.
         if prefix or suffix then
+            local compact = self._compact == true
             local affix = text(input.Instance, "", 11, "MutedText", {
                 AnchorPoint = Vector2.new(1, 0.5),
                 Position = UDim2.new(1, -12, 0.5, 0),
-                Size = UDim2.fromOffset(76, 26),
+                Size = compact and UDim2.fromOffset(30, 26) or UDim2.fromOffset(76, 26),
                 TextXAlignment = Enum.TextXAlignment.Right,
             })
-            box.Position = UDim2.new(1, -94, 0.5, 0)
-            box.Size = UDim2.fromOffset(84, 28)
+            if compact then
+                box.Position = UDim2.new(1, -46, 0.5, 0)
+                box.Size = UDim2.new(0.4, 0, 0, 26)
+            else
+                box.Position = UDim2.new(1, -94, 0.5, 0)
+                box.Size = UDim2.fromOffset(84, 28)
+            end
             local adorn = function()
                 affix.Text = tostring(prefix or "") .. (box.Text or "") .. tostring(suffix or "")
             end
@@ -3592,7 +3672,7 @@ function Section:AddSegmented(options)
         })
         corner(button, 5)
         buttons[item] = button
-        connect(button.Activated, function() if not disabled then set(item) end end, self.Window._connections)
+        connect(button.Activated, function(input) if not disabled then if Library:_isObscured(self.Window, input and input.Position) then return end set(item) end end, self.Window._connections)
     end
     bindThemeState(holder, render)
     registerFlagSetter(self.Window, options.Flag, set)
@@ -4039,7 +4119,10 @@ function Tab:AddSection(options)
         Parent = sectionFrame,
     })
     section.Collapsible = options.Collapsible == true
-    connect(collapseButton.Activated, function()
+    connect(collapseButton.Activated, function(input)
+        if Library:_isObscured(self.Window, input and input.Position) then
+            return
+        end
         if section._dragState and section._dragState.Dragged then
             section._dragState.Dragged = false
             return
@@ -4079,12 +4162,15 @@ end
 
 -- Filters one section in place. Returns the number of visible controls, or
 -- nil when nothing matched so callers can hide the whole section heading.
+-- Search bars (BloodshotSearch) are never hidden by filtering.
 local function filterSection(section, query)
     local visible = 0
     local all, rows = collectSearchable(section)
     local matched = {}
     for _, control in ipairs(all) do
-        if string.find(string.lower(control.Name), query, 1, true) ~= nil then
+        if control:GetAttribute("BloodshotSearch") == true then
+            matched[control] = true
+        elseif string.find(string.lower(control.Name), query, 1, true) ~= nil then
             matched[control] = true
         end
     end
@@ -4098,20 +4184,25 @@ local function filterSection(section, query)
         return false
     end
     for _, control in ipairs(all) do
-        local isRow = control:GetAttribute("BloodshotRow") == true
-        local show
-        if isRow then
-            -- A row stays visible when its own name matches or any child does.
-            local anyChild = false
-            for _, child in ipairs(control:GetDescendants()) do
-                if child:IsA("GuiObject") and matched[child] then anyChild = true break end
-            end
-            show = matched[control] or anyChild
+        if control:GetAttribute("BloodshotSearch") == true then
+            control.Visible = true
+            visible += 1
         else
-            show = matched[control]
+            local isRow = control:GetAttribute("BloodshotRow") == true
+            local show
+            if isRow then
+                -- A row stays visible when its own name matches or any child does.
+                local anyChild = false
+                for _, child in ipairs(control:GetDescendants()) do
+                    if child:IsA("GuiObject") and matched[child] then anyChild = true break end
+                end
+                show = matched[control] or anyChild
+            else
+                show = matched[control]
+            end
+            control.Visible = show and not blocked(control)
+            if control.Visible then visible += 1 end
         end
-        control.Visible = show and not blocked(control)
-        if control.Visible then visible += 1 end
     end
     return visible
 end
@@ -4190,12 +4281,6 @@ function Section:AddSearch(options)
     bindTheme(box, "PlaceholderColor3", "MutedText")
     corner(box, 5)
     padding(box, 0, 8, 0, 8)
-    local icon = text(holder, "\u{1F50D}", 12, "MutedText", {
-        AnchorPoint = Vector2.new(1, 0.5),
-        Position = UDim2.new(1, -146, 0.5, 0),
-        Size = UDim2.fromOffset(14, 20),
-        TextXAlignment = Enum.TextXAlignment.Center,
-    })
     local matches = 0
     local function run(query)
         query = tostring(query or "")
@@ -4219,7 +4304,6 @@ function Section:AddSearch(options)
             nameLabel.Text = options.Name or T("SearchPlaceholder")
             nameLabel.TextColor3 = Library.Theme.Text
         end
-        icon.TextColor3 = matches > 0 and Library.Theme.Accent or Library.Theme.MutedText
         if not options.Flag then return end
         Library.Flags[options.Flag] = query
     end
@@ -4233,6 +4317,7 @@ function Section:AddSearch(options)
     connect(box.FocusLost, function()
         tween(box, 0.15, { BackgroundColor3 = Library.Theme.Background })
     end, self.Window._connections)
+    holder:SetAttribute("BloodshotSearch", true)
     return {
         Instance = holder,
         Set = function(_, query) box.Text = tostring(query or "") end,
@@ -4253,7 +4338,12 @@ end
 function Section:AddSummary(options)
     options = type(options) == "table" and options or {}
     local template = options.Template or options.Text or ""
-    local holder = createControlBase(self, options.Height or 34, options.Name or "Summary")
+    local holder, nameLabel = createControlBase(self, options.Height or 34, options.Name or "Summary")
+    -- The template body is the visible text; the base name label would sit
+    -- directly underneath it and overlap, so hide it.
+    if nameLabel then
+        nameLabel.Visible = false
+    end
     local body = text(holder, "", options.TextSize or 12, options.Color or "Text", {
         Position = UDim2.fromOffset(12, 0),
         Size = UDim2.new(1, -24, 1, 0),
@@ -4485,7 +4575,7 @@ function Section:AddList(options)
         })
         local remove
         if options.Removable ~= false then
-            remove = text(frame, "\u{2715}", 12, "MutedText", {
+            remove = text(frame, "x", 12, "MutedText", {
                 AnchorPoint = Vector2.new(1, 0.5),
                 Position = UDim2.new(1, -8, 0.5, 0),
                 Size = UDim2.fromOffset(18, 20),
@@ -4494,6 +4584,9 @@ function Section:AddList(options)
             connect(remove.InputBegan, function(input)
                 if input.UserInputType == Enum.UserInputType.MouseButton1
                     or input.UserInputType == Enum.UserInputType.Touch then
+                    if Library:_isObscured(self.Window, input.Position) then
+                        return
+                    end
                     if not list:RemoveRow(entry.Key or entry.Label.Text) then
                         list:Remove(entry.Data)
                     end
@@ -4842,22 +4935,40 @@ function Tab:Search(query)
     for _, section in ipairs(self.Sections) do
         local sectionMatch = string.find(string.lower(section.Name), query, 1, true) ~= nil
         local sectionVisible = sectionMatch
+        local hasSearch = false
+        for _, control in ipairs(collectSearchable(section)) do
+            if control:GetAttribute("BloodshotSearch") == true then
+                hasSearch = true
+                break
+            end
+        end
         if not sectionMatch then
             -- Section name alone is not enough: a matching control anywhere in
             -- the section keeps that section on screen with just its hits.
             for _, control in ipairs(collectSearchable(section)) do
-                if string.find(string.lower(control.Name), query, 1, true) ~= nil then
-                    sectionVisible = true
-                    break
+                if control:GetAttribute("BloodshotSearch") ~= true then
+                    if string.find(string.lower(control.Name), query, 1, true) ~= nil then
+                        sectionVisible = true
+                        break
+                    end
                 end
             end
         end
+        -- A section hosting a search bar never hides while searching, so the
+        -- bar itself stays on screen.
+        if hasSearch then
+            sectionVisible = true
+        end
         if sectionMatch then
             for _, control in ipairs(collectSearchable(section)) do
-                local blocked = control:GetAttribute("BloodshotDependencyMet") == false
-                    or (control.Parent and control.Parent.Parent
-                        and control.Parent.Parent:GetAttribute("BloodshotDependencyMet") == false)
-                control.Visible = not blocked
+                if control:GetAttribute("BloodshotSearch") == true then
+                    control.Visible = true
+                else
+                    local blocked = control:GetAttribute("BloodshotDependencyMet") == false
+                        or (control.Parent and control.Parent.Parent
+                            and control.Parent.Parent:GetAttribute("BloodshotDependencyMet") == false)
+                    control.Visible = not blocked
+                end
             end
         else
             filterSection(section, query)
@@ -5010,8 +5121,11 @@ function Window:MoveTab(tab, index)
 end
 
 function Window:SetTabsReorderable(enabled)
-    self._tabsReorderable = not not enabled
-    return self._tabsReorderable
+    -- Drag-to-reorder tabs was removed; kept as a no-op so existing scripts
+    -- calling SetTabsReorderable(true) do not error. Index reordering via
+    -- MoveTab still works.
+    self._tabsReorderable = false
+    return false
 end
 
 function Window:SetPosition(position)
@@ -5630,55 +5744,12 @@ function Window:AddTab(name, icon)
             if image then tween(image, 0.14, { ImageColor3 = Library.Theme.MutedText }) end
         end
     end, self._connections)
-    connect(button.Activated, function() self:SelectTab(tab) end, self._connections)
-    if self._tabsReorderable then
-        local dragging, started, startPoint = false, false, nil
-        connect(button.InputBegan, function(input)
-            if input.UserInputType ~= Enum.UserInputType.MouseButton1
-                and input.UserInputType ~= Enum.UserInputType.Touch then
-                return
-            end
-            dragging, started, startPoint = true, false, input.Position
-        end, self._connections)
-        connect(UserInputService.InputChanged, function(input)
-            if not dragging then return end
-            if input.UserInputType ~= Enum.UserInputType.MouseMovement
-                and input.UserInputType ~= Enum.UserInputType.Touch then
-                return
-            end
-            if not started then
-                if (input.Position - startPoint).Magnitude < 6 then return end
-                started = true
-            end
-            local vertical = not self._layout.SidebarHorizontal
-            local probe = vertical and input.Position.Y or input.Position.X
-            local best, bestDistance = 1, math.huge
-            for slot, sibling in ipairs(self.TabList:GetChildren()) do
-                if sibling:IsA("GuiButton") and sibling ~= button then
-                    local centre = vertical
-                        and (sibling.AbsolutePosition.Y + sibling.AbsoluteSize.Y / 2)
-                        or (sibling.AbsolutePosition.X + sibling.AbsoluteSize.X / 2)
-                    local distance = math.abs(probe - centre)
-                    if distance < bestDistance then
-                        best, bestDistance = slot, distance
-                    end
-                end
-            end
-            local current = 1
-            for slot, sibling in ipairs(self.TabList:GetChildren()) do
-                if sibling == button then current = slot break end
-            end
-            if best ~= current then
-                reorderList(self.TabList, button, best)
-            end
-        end, self._connections)
-        connect(UserInputService.InputEnded, function(input)
-            if dragging and (input.UserInputType == Enum.UserInputType.MouseButton1
-                or input.UserInputType == Enum.UserInputType.Touch) then
-                dragging, started = false, false
-            end
-        end, self._connections)
-    end
+    connect(button.Activated, function(input)
+        if Library:_isObscured(self, input and input.Position) then
+            return
+        end
+        self:SelectTab(tab)
+    end, self._connections)
     if not self.ActiveTab then self:SelectTab(tab) end
     return tab
 end
@@ -5907,8 +5978,8 @@ function Library:CreateWindow(options)
         math.clamp(minimumSize.Y, 180, 2160)
     )
     local minimizedWidth = math.clamp(tonumber(options.MinimizedWidth) or 320, 220, 480)
-    local toggleCombo = parseComboKey(options.ToggleKey or Enum.KeyCode.RightShift)
-        or parseComboKey(Enum.KeyCode.RightShift)
+    local toggleCombo = parseComboKey(options.ToggleKey or Enum.KeyCode.Insert)
+        or parseComboKey(Enum.KeyCode.Insert)
     local connections = {}
     local root = new("Frame", {
         Name = options.Title or "Bloodshot",
@@ -6330,7 +6401,7 @@ function Library:CreateWindow(options)
         _tabByName = {},
         _titleLabel = titleLabel,
         _subtitleLabel = subtitleLabel,
-        _tabsReorderable = options.ReorderableTabs ~= false,
+        _tabsReorderable = false,
         _reorderEnabled = options.Reorderable ~= false,
         _themeOverrides = nil,
         _onClose = type(options.OnClose) == "function" and options.OnClose or nil,
@@ -6348,7 +6419,16 @@ function Library:CreateWindow(options)
     self:FocusWindow(window, false)
 
     makeDraggable(topbar, root, connections)
-    connect(root.InputBegan, function()
+    connect(root.InputBegan, function(input)
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+            and input.UserInputType ~= Enum.UserInputType.Touch then
+            return
+        end
+        -- Click-to-focus only: hover (MouseMovement) never changes focus, and a
+        -- click that lands on a higher overlapping window must not steal focus.
+        if Library:_isObscured(window, input.Position) then
+            return
+        end
         Library:FocusWindow(window)
     end, connections)
     if options.Resizable ~= false then
@@ -6370,19 +6450,42 @@ function Library:CreateWindow(options)
         local resizing = false
         local resizeStart
         local startSize
+        local startPosition
         connect(resizeHandle.InputBegan, function(input)
             if input.UserInputType == Enum.UserInputType.MouseButton1
                 or input.UserInputType == Enum.UserInputType.Touch then
+                if Library:_isObscured(window, input.Position) then
+                    return
+                end
                 resizing = true
                 resizeStart = input.Position
                 startSize = root.AbsoluteSize
+                startPosition = root.Position
+                Library:FocusWindow(window)
             end
         end, connections)
         connect(UserInputService.InputChanged, function(input)
             if resizing and (input.UserInputType == Enum.UserInputType.MouseMovement
                 or input.UserInputType == Enum.UserInputType.Touch) then
                 local delta = input.Position - resizeStart
-                window:SetSize(UDim2.fromOffset(startSize.X + delta.X, startSize.Y + delta.Y))
+                -- Root is anchored at 0.5,0.5, so growing Size alone moves the
+                -- bottom-right corner by only half the delta. Shift Position by
+                -- half the applied growth to keep the top-left fixed, which keeps
+                -- the handle itself under the cursor. When clamped at the minimum
+                -- size the handle legitimately stops following.
+                local desiredW = startSize.X + delta.X
+                local desiredH = startSize.Y + delta.Y
+                local clampedW = math.max(window._minimumSize.X, desiredW)
+                local clampedH = math.max(window._minimumSize.Y, desiredH)
+                local appliedX = clampedW - startSize.X
+                local appliedY = clampedH - startSize.Y
+                window:SetSize(UDim2.fromOffset(clampedW, clampedH))
+                root.Position = UDim2.new(
+                    startPosition.X.Scale,
+                    startPosition.X.Offset + appliedX / 2,
+                    startPosition.Y.Scale,
+                    startPosition.Y.Offset + appliedY / 2
+                )
             end
         end, connections)
         connect(UserInputService.InputEnded, function(input)
@@ -6406,7 +6509,10 @@ function Library:CreateWindow(options)
                 TextColor3 = Library.Theme.MutedText,
             })
         end, connections)
-        connect(closeButton.Activated, function()
+        connect(closeButton.Activated, function(input)
+            if Library:_isObscured(window, input and input.Position) then
+                return
+            end
             window:RequestClose()
         end, connections)
     end
@@ -6423,7 +6529,10 @@ function Library:CreateWindow(options)
                 TextColor3 = Library.Theme.MutedText,
             })
         end, connections)
-        connect(minimize.Activated, function()
+        connect(minimize.Activated, function(input)
+            if Library:_isObscured(window, input and input.Position) then
+                return
+            end
             window:ToggleMinimized()
         end, connections)
     end
