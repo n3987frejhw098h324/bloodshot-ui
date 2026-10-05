@@ -1822,21 +1822,30 @@ local function createControlBase(section, height, name, description)
         Size = UDim2.new(1, 0, 0, height),
         Parent = section.Container,
     })
-    bindTheme(holder, "BackgroundColor3", "SurfaceAlt")
-    gradient(holder, "SurfaceAlt", "SurfaceGradient", 12)
-    corner(holder, 6)
-    local holderStroke = stroke(holder, Library.Theme.Border, 1, 0.45, "Border")
-    tween(holder, 0.24, { BackgroundTransparency = Library.Theme.ControlTransparency or 0.8 })
-    connect(holder.MouseEnter, function()
-        tween(holder, 0.16, { BackgroundTransparency = 0.68 })
-        tween(holderStroke, 0.16, { Transparency = 0.2 })
-    end, section.Window._connections)
-    connect(holder.MouseLeave, function()
-        tween(holder, 0.16, { BackgroundTransparency = Library.Theme.ControlTransparency or 0.8 })
-        tween(holderStroke, 0.16, { Transparency = 0.45 })
-    end, section.Window._connections)
-
     local compact = section._compact == true
+    bindTheme(holder, "BackgroundColor3", "SurfaceAlt")
+    local holderStroke
+    if compact then
+        -- Row children are chrome-free: the row is already a card, so a second
+        -- bordered/filled control inside it looks like a nested box. Skipping
+        -- this at creation (rather than stripping it later) also avoids the
+        -- entry tween re-filling the holder after a post-pass cleared it.
+        holder.BackgroundTransparency = 1
+        corner(holder, 6)
+    else
+        gradient(holder, "SurfaceAlt", "SurfaceGradient", 12)
+        corner(holder, 6)
+        holderStroke = stroke(holder, Library.Theme.Border, 1, 0.45, "Border")
+        tween(holder, 0.24, { BackgroundTransparency = Library.Theme.ControlTransparency or 0.8 })
+        connect(holder.MouseEnter, function()
+            tween(holder, 0.16, { BackgroundTransparency = 0.68 })
+            tween(holderStroke, 0.16, { Transparency = 0.2 })
+        end, section.Window._connections)
+        connect(holder.MouseLeave, function()
+            tween(holder, 0.16, { BackgroundTransparency = Library.Theme.ControlTransparency or 0.8 })
+            tween(holderStroke, 0.16, { Transparency = 0.45 })
+        end, section.Window._connections)
+    end
     local nameLabel = text(holder, name or "Control", compact and 11 or 13, "Text", {
         Position = UDim2.fromOffset(12, description and 8 or 0),
         Size = UDim2.new(1, -24, 0, description and 18 or height),
@@ -1850,6 +1859,8 @@ local function createControlBase(section, height, name, description)
         })
     end
     holder:SetAttribute("BloodshotControl", true)
+    -- Only the first TextLabel is the name; a search/description label added
+    -- later must not be mistaken for one when compacting.
     holder:SetAttribute("BloodshotCompact", compact)
     holder:SetAttribute("BloodshotDisabled", false)
     holder:SetAttribute("BloodshotBaseHeight", height)
@@ -1867,6 +1878,17 @@ local function compactifyControl(holder, rowHeight)
     if not holder or not holder.Parent then return end
     holder.Size = UDim2.new(1, 0, 1, 0)
     holder:SetAttribute("BloodshotCompact", true)
+    -- Compact children are chrome-free: the row already provides the surface, so
+    -- a second bordered card inside it reads as clutter. Drop the fill, gradient
+    -- and stroke rather than only fading them.
+    holder.BackgroundTransparency = 1
+    -- Strip edges from the whole subtree, not just the holder: several controls
+    -- outline their own parts (the colour preview, keybind box, slider knob).
+    for _, effect in ipairs(holder:GetDescendants()) do
+        if effect:IsA("UIStroke") or effect:IsA("UIGradient") then
+            effect:Destroy()
+        end
+    end
     local nameLabel
     local seenLabel = 0
     for _, child in ipairs(holder:GetChildren()) do
@@ -1889,6 +1911,11 @@ local function compactifyControl(holder, rowHeight)
                 height = rowHeight
             elseif height <= 0 or height > rowHeight then
                 height = math.min(math.max(height, 1), rowHeight)
+            end
+            -- Cap interactive parts to a sane column height so a 44px control
+            -- does not poke out of a 34px row.
+            if not child:IsA("UICorner") and not child:IsA("UIStroke") then
+                height = math.min(height, math.max(18, rowHeight - 8))
             end
             child.AnchorPoint = Vector2.new(child.AnchorPoint.X, 0.5)
             child.Position = UDim2.new(child.Position.X.Scale, child.Position.X.Offset, 0.5, 0)
@@ -2153,11 +2180,55 @@ function Section:AddRow(options)
             return nil
         end
         local rowNameLabel = compactifyControl(result.Instance, rowHeight)
-        -- Narrow fixed columns cannot fit both a name and an interactive part
-        -- side by side; hiding the name prevents the two texts overlapping.
-        -- The slot keeps its width so the row layout does not shift.
-        if width and width < 90 and rowNameLabel then
-            rowNameLabel.Visible = false
+        -- Give every compact child a small uniform inset so controls do not sit
+        -- flush against the slot edge, and keep the name clear of the
+        -- interactive part instead of letting the two overlap.
+        local inset = math.clamp(math.floor((rowHeight - 20) / 2), 2, 8)
+        local columnWidth = result.Instance.AbsoluteSize.X
+        if columnWidth <= 0 then columnWidth = width or (rowHeight * 2) end
+        for _, part in ipairs(result.Instance:GetChildren()) do
+            if part:IsA("GuiObject") and not part:IsA("UICorner")
+                and not part:IsA("UIStroke") and not part:IsA("UIGradient")
+                and not part:IsA("UIPadding") and not part:IsA("UIScale") then
+                -- Scale-sized parts (the 52% interactive split and the full-width
+                -- name) stay proportional; only offset-sized ones get the inset.
+                -- Shrinking the scale instead of the offset is what keeps a
+                -- full-width label from sliding under the control on its right.
+                if part.Size.X.Scale ~= 0 then
+                    local insetScale = inset / math.max(1, columnWidth)
+                    part.Position = UDim2.new(part.Position.X.Scale, part.Position.X.Offset + inset, 0.5, 0)
+                    part.Size = UDim2.new(
+                        math.max(0.05, part.Size.X.Scale - insetScale * 2),
+                        part.Size.X.Offset,
+                        0,
+                        part.Size.Y.Offset
+                    )
+                else
+                    part.Position = UDim2.new(0, part.Position.X.Offset + inset, 0.5, 0)
+                    part.Size = UDim2.new(0, math.max(8, part.Size.X.Offset - inset * 2), 0, part.Size.Y.Offset)
+                end
+            end
+        end
+        -- A name and an interactive part cannot share a column: whichever is
+        -- wider would overlap the other. Fixed columns below ~150px keep only
+        -- the control (the value is the point); wider ones keep only the name,
+        -- because a bare label reads better than a nameless control. The slot
+        -- keeps its width either way, so the row layout does not shift.
+        if rowNameLabel then
+            local columnIsFixed = width ~= nil
+            local hasControl = false
+            for _, part in ipairs(result.Instance:GetChildren()) do
+                if (part:IsA("GuiButton") or part:IsA("TextBox")) and part.Visible then
+                    hasControl = true
+                    break
+                end
+            end
+            if hasControl then
+                local effective = columnIsFixed and width or columnWidth
+                if effective < 150 then
+                    rowNameLabel.Visible = false
+                end
+            end
         end
         result.Window = window
         -- Section.Add* is the enriched wrapper, so the child already carries the full
@@ -3153,7 +3224,9 @@ function Section:AddColorPicker(options)
     table.insert(self._overlays, panel)
     bindTheme(panel, "BackgroundColor3", "Background")
     corner(panel, 5)
-    padding(panel, 10, 10, 10, 10)
+    -- No UIPadding here: every child is absolutely positioned, and padding
+    -- would silently shift all of them by 10px while PANEL_HEIGHT below is
+    -- computed from the raw offsets.
     local labels = { "R", "G", "B" }
     local boxes = {}
     local value = options.Default or Color3.new(1, 1, 1)
@@ -3170,15 +3243,20 @@ function Section:AddColorPicker(options)
             end
         end
     end
+    -- Preset swatches are no longer rendered: the grid made the panel grow
+    -- downwards and pushed the footer row into it. Presets still resolve
+    -- through GetPresets/SetPreset so existing scripts keep working.
     local presetColumns = math.clamp(math.floor(tonumber(options.PresetColumns) or 8), 1, 16)
-    local presetRows = #presets > 0 and math.ceil(#presets / presetColumns) or 0
     local presetSwatches = {}
-    local presetArea = presetRows > 0 and presetRows * 20 + 6 or 0
-    -- Presets only ever grow the panel downwards; the layout math below keys off
-    -- this constant, so it has to include the swatch grid before anything is built.
-    -- Top chrome tightened (labels at 18 instead of 24) so there is no empty
-    -- band above the RGB fields.
-    local PANEL_HEIGHT = 176 + presetArea
+    -- RGB labels (18) + boxes (36..61) + SV square (68..140) + footer (146..170)
+    -- + bottom padding. Footer is laid out from the bottom edge so it can never
+    -- overlap the SV square.
+    local FOOTER_HEIGHT = 24
+    local FOOTER_BOTTOM = 10
+    local FOOTER_GAP = 8
+    -- SV square ends at 140 (offset 68 + height 72). The footer goes below it,
+    -- so the panel has to be tall enough to hold both plus the gap.
+    local PANEL_HEIGHT = 140 + FOOTER_GAP + FOOTER_HEIGHT + FOOTER_BOTTOM
     local function placePanel()
         if not open then return end
         local rootFrame = self.Window.Root
@@ -3235,6 +3313,9 @@ function Section:AddColorPicker(options)
         end
     end, self.Window._connections)
 
+    -- Forward declaration: set() below writes the hex readout, and it is defined
+    -- before the label exists.
+    local hexLabel
     local closePicker = new("TextButton", {
         AnchorPoint = Vector2.new(1, 0),
         Position = UDim2.new(1, 0, 0, 0),
@@ -3263,9 +3344,9 @@ function Section:AddColorPicker(options)
             math.floor(value.B * 255 + 0.5),
         }
         for index, box in ipairs(boxes) do box.Text = tostring(rgb[index]) end
-        if hexBox then
-            hexBox.Text = string.format("#%02X%02X%02X", rgb[1], rgb[2], rgb[3])
-        end
+        -- Read-only hex readout (was an editable TextBox, which duplicated the
+        -- R/G/B fields and had no room in the footer).
+        hexLabel.Text = string.format("#%02X%02X%02X", rgb[1], rgb[2], rgb[3])
         if options.Flag then Library.Flags[options.Flag] = value end
         if not silent then safeCall(options.Callback, value, alpha) end
     end
@@ -3383,65 +3464,30 @@ function Section:AddColorPicker(options)
         if input.UserInputType == Enum.UserInputType.MouseButton1
             or input.UserInputType == Enum.UserInputType.Touch then hsvDragTarget = nil end
     end, self.Window._connections)
-    local presetHost
-    if presetRows > 0 then
-        presetHost = new("Frame", {
-            Name = "Presets",
-            Position = UDim2.new(0, 0, 0, 146),
-            Size = UDim2.new(1, 0, 0, presetArea),
-            BackgroundTransparency = 1,
-            ClipsDescendants = true,
-            Parent = panel,
-        })
-        new("UIGridLayout", {
-            CellSize = UDim2.new(1 / presetColumns, -4, 0, 17),
-            CellPadding = UDim2.new(0, 4, 0, 3),
-            FillDirection = Enum.FillDirection.Horizontal,
-            SortOrder = Enum.SortOrder.LayoutOrder,
-            Parent = presetHost,
-        })
-        for index, preset in ipairs(presets) do
-            local swatch = new("TextButton", {
-                Name = "Preset" .. index,
-                BackgroundColor3 = preset,
-                BorderSizePixel = 0,
-                AutoButtonColor = false,
-                Text = "",
-                LayoutOrder = index,
-                Parent = presetHost,
-            })
-            corner(swatch, 4)
-            stroke(swatch, Color3.new(1, 1, 1), 1, 0.55)
-            connect(swatch.MouseEnter, function()
-                tween(swatch, 0.12, { BackgroundTransparency = 0.15 })
-            end, self.Window._connections)
-            connect(swatch.MouseLeave, function()
-                tween(swatch, 0.12, { BackgroundTransparency = 0 })
-            end, self.Window._connections)
-            connect(swatch.Activated, function(input) if Library:_isObscured(self.Window, input and input.Position) then return end set(presets[index]) end, self.Window._connections)
-            presetSwatches[index] = swatch
-        end
-    end
-
-    local hexBox
-    hexBox = new("TextBox", {
-        Position = UDim2.new(0, 0, 1, -26),
-        Size = options.Alpha == true and UDim2.new(0.5, -4, 0, 24) or UDim2.new(1, -80, 0, 24),
-        BackgroundColor3 = Library.Theme.SurfaceAlt, BorderSizePixel = 0,
-        ClearTextOnFocus = false, Font = Enum.Font.Code, TextColor3 = Library.Theme.Text,
-        TextSize = 11, ZIndex = 4, Parent = panel,
+    -- Footer row: hex readout + optional alpha on the left, Reset on the right.
+    -- Anchored to the bottom edge (1, -(FOOTER_HEIGHT + FOOTER_BOTTOM)) so it
+    -- always sits below the SV square instead of on top of the colour area.
+    -- Distance from the bottom edge to the footer's vertical centre: half its
+    -- height plus the bottom margin. Anchoring it to the bottom (rather than a
+    -- fixed offset) keeps it below the SV square for any panel height.
+    local footerY = FOOTER_HEIGHT / 2 + FOOTER_BOTTOM
+    hexLabel = text(panel, "", 11, "MutedText", {
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = UDim2.new(0, 0, 1, -footerY),
+        Size = UDim2.fromOffset(96, FOOTER_HEIGHT),
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Font = Enum.Font.Code,
+        ZIndex = 5,
     })
-    corner(hexBox, 4)
-    bindTheme(hexBox, "BackgroundColor3", "SurfaceAlt")
-    bindTheme(hexBox, "TextColor3", "Text")
     local alphaBox
     if options.Alpha == true then
         alphaBox = new("TextBox", {
-            Position = UDim2.new(0.5, 4, 1, -26), Size = UDim2.new(0.5, -84, 0, 24),
+            AnchorPoint = Vector2.new(1, 0.5),
+            Position = UDim2.new(1, -80, 1, -footerY), Size = UDim2.fromOffset(64, FOOTER_HEIGHT),
             BackgroundColor3 = Library.Theme.SurfaceAlt, BorderSizePixel = 0,
             ClearTextOnFocus = false, Font = Enum.Font.Code, TextColor3 = Library.Theme.Text,
             Text = tostring(math.floor(alpha * 100 + 0.5)) .. "%", PlaceholderText = "Alpha",
-            TextSize = 10, ZIndex = 4, Parent = panel,
+            TextSize = 10, ZIndex = 5, Parent = panel,
         })
         corner(alphaBox, 4)
         bindTheme(alphaBox, "BackgroundColor3", "SurfaceAlt")
@@ -3453,9 +3499,11 @@ function Section:AddColorPicker(options)
         end, self.Window._connections)
     end
     local reset
+    local control_Reset
     if options.ResetButton ~= false then
         reset = new("TextButton", {
-            Position = UDim2.new(1, -72, 1, -26), Size = UDim2.fromOffset(72, 24),
+            AnchorPoint = Vector2.new(1, 0.5),
+            Position = UDim2.new(1, 0, 1, -footerY), Size = UDim2.fromOffset(72, FOOTER_HEIGHT),
             BackgroundColor3 = Library.Theme.SurfaceAlt, BorderSizePixel = 0,
             Text = options.ResetText or T("Reset"), TextColor3 = Library.Theme.MutedText,
             Font = Enum.Font.GothamMedium,
@@ -3464,16 +3512,15 @@ function Section:AddColorPicker(options)
         corner(reset, 4)
         bindTheme(reset, "BackgroundColor3", "SurfaceAlt")
         bindTheme(reset, "TextColor3", "MutedText")
+        connect(reset.MouseEnter, function()
+            tween(reset, 0.12, { TextColor3 = Library.Theme.Error })
+        end, self.Window._connections)
+        connect(reset.MouseLeave, function()
+            tween(reset, 0.12, { TextColor3 = Library.Theme.MutedText })
+        end, self.Window._connections)
         connect(reset.Activated, function(input) if Library:_isObscured(self.Window, input and input.Position) then return end set(defaultColor) end, self.Window._connections)
+        control_Reset = reset
     end
-    connect(hexBox.FocusLost, function()
-        local raw = hexBox.Text:gsub("#", "")
-        if raw:match("^%x%x%x%x%x%x$") then
-            set(Color3.fromRGB(tonumber(raw:sub(1, 2), 16), tonumber(raw:sub(3, 4), 16), tonumber(raw:sub(5, 6), 16)))
-        else
-            set(value, true)
-        end
-    end, self.Window._connections)
     connect(preview.Activated, function(input)
         if Library:_isObscured(self.Window, input and input.Position) then
             return
@@ -3509,18 +3556,15 @@ function Section:AddColorPicker(options)
         SetOpen = function(_, nextOpen) setOpen(nextOpen) end,
         Presets = presets,
         PresetColumns = presetColumns,
-        -- Preset swatches in creation order, plus the panel they live in. Read
-        -- from the tree too, because the grid is parented to the window root.
+        -- Preset colors in the order they were passed in. The swatch grid is no
+        -- longer rendered, so this is the list itself rather than instances.
         Swatches = presetSwatches,
         Panel = panel,
+        -- The Reset button instance, under a distinct name: Reset itself is the
+        -- method that restores the default colour.
+        ResetButton = control_Reset,
         GetPresets = function()
-            local host = panel:FindFirstChild("Presets")
-            if not host then return presetSwatches end
-            local found = {}
-            for _, child in ipairs(host:GetChildren()) do
-                if child:IsA("TextButton") then found[#found + 1] = child end
-            end
-            return found
+            return presets
         end,
     }
     -- Set here rather than in the literal above: a closure written inside a table
@@ -4586,19 +4630,23 @@ function Section:AddList(options)
             bindTheme(icon, "ImageColor3", "MutedText")
             offset += 24
         end
+        -- UDim2.fromOffset(x, y) sets *both* axes as pixel offsets, so the 0.5
+        -- centre below has to be a scale component (UDim2.new(0, x, 0.5, 0)).
+        -- Using fromOffset(offset, 0.5) pinned these labels half a pixel from
+        -- the top, which put the row text visibly above the middle.
         local indexLabel
         if showIndex then
             indexLabel = text(frame, "", 10, "MutedText", {
                 AnchorPoint = Vector2.new(0, 0.5),
-                Position = UDim2.fromOffset(offset, 0.5),
-                Size = UDim2.fromOffset(18, 18),
+                Position = UDim2.new(0, offset, 0.5, 0),
+                Size = UDim2.fromOffset(18, rowHeight),
                 TextXAlignment = Enum.TextXAlignment.Left,
             })
             offset += 22
         end
         local label = text(frame, "", 11, "Text", {
             AnchorPoint = Vector2.new(0, 0.5),
-            Position = UDim2.fromOffset(offset, 0.5),
+            Position = UDim2.new(0, offset, 0.5, 0),
             Size = UDim2.new(1, -(offset + 112), 0, rowHeight),
             TextXAlignment = Enum.TextXAlignment.Left,
         })
