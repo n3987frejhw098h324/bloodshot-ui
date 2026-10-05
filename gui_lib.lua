@@ -84,9 +84,10 @@ local Library = {
 -- Generic subscribe/emit pair behind every Bloodshot event (tab changes,
 -- visibility, geometry, spec export). Listeners are copied before dispatch so a
 -- callback may unbind itself mid-emit, and errors never abort the fan-out.
--- _subscribe remembers the emitter arguments, and _emit replays them before the
--- emit-time arguments. Window:_subscribe stores `self` so every handler receives
--- the window as its first argument regardless of how the event was raised.
+-- _subscribe remembers any extra arguments given after the callback, and _emit
+-- replays them before the emit-time arguments; events raised by a window already
+-- pass the window as their first emit-time argument, so those subscribers store
+-- nothing extra.
 function Library:_subscribe(event, callback, ...)
     if type(callback) ~= "function" then
         return false, "Event handlers must be functions"
@@ -127,9 +128,17 @@ function Library:_emit(event, ...)
     for _, entry in ipairs(snapshot) do
         if entry.Alive then
             fired += 1
+            -- Subscribe-time arguments are prepended by hand: only the final
+            -- expression in an argument list expands, so table.unpack(Args) next
+            -- to `...` would be truncated to a single nil for handlers that stored
+            -- no extra arguments.
+            local call = table.pack(...)
+            for index = entry.Args.n, 1, -1 do
+                table.insert(call, 1, entry.Args[index])
+            end
             -- pcall inlined rather than using safeCall: _emit is defined before
             -- safeCall exists, so a safeCall call here would resolve to a global.
-            local ok, err = pcall(entry.Callback, table.unpack(entry.Args, 1, entry.Args.n), ...)
+            local ok, err = pcall(entry.Callback, table.unpack(call, 1, call.n))
             if not ok then
                 warn("[Bloodshot UI] " .. tostring(event) .. " listener error: " .. tostring(err))
             end
@@ -163,10 +172,18 @@ local function T(key)
 end
 
 local DEFAULT_THEME
-local function copyTable(source)
+-- `seen` makes the copy cycle-safe. Options tables are copied into control.Spec
+-- verbatim, and callers legitimately pass live library objects (AddSearch's
+-- Target = tab, for instance), whose tab -> section -> window -> tab back
+-- references would otherwise recurse until the stack ran out.
+local function copyTable(source, seen)
+    if type(source) ~= "table" then return source end
+    seen = seen or {}
+    if seen[source] then return seen[source] end
     local result = {}
+    seen[source] = result
     for key, value in pairs(source) do
-        result[key] = type(value) == "table" and copyTable(value) or value
+        result[key] = copyTable(value, seen)
     end
     return result
 end
@@ -668,6 +685,10 @@ function Library:OnFlagChanged(flag, callback)
         self._flagListeners[key] = listeners
     end
     table.insert(listeners, entry)
+    -- A control that owns the flag publishes through its own setter, so that
+    -- setter has to fan out to this listener. Without this, a listener added
+    -- after the control existed would never be called by Library:SetFlag.
+    if flag ~= nil then self:_hookFlag(key) end
     return {
         Flag = key,
         Unbind = function()
@@ -775,10 +796,9 @@ function Library:Bind(flag, target, property, options)
         self:SetFlag(binding.Flag, value, binding.Silent)
     end
 
-    -- Register the listener first: _hookFlag only wraps setters when somebody
-    -- is actually subscribed to the flag.
+    -- OnFlagChanged hooks the flag's setter as part of subscribing, so the order
+    -- here is what matters, not the extra call.
     table.insert(binding.Disposers, self:OnFlagChanged(flag, apply))
-    self:_hookFlag(flag)
     if options.Character ~= false and (binding.Resolve or options.Character) then
         local connection = LocalPlayer.CharacterAdded:Connect(function()
             task.defer(apply)
@@ -1099,8 +1119,11 @@ function Library:ImportLegacy(source, mapping)
     for flag, kind in pairs(type(mapping.Types) == "table" and mapping.Types or {}) do
         local source = flag
         local target = flag
+        local wanted = kind
         if type(kind) == "table" then
-            kind = kind.Kind or kind.Type or kind[1]
+            -- Read every field off the table before rebinding to the kind string,
+            -- otherwise kind.Source/kind.Flag are looked up on that string.
+            wanted = kind.Kind or kind.Type or kind[1]
             source = kind.Source or flag
             target = kind.Flag or flag
         end
@@ -1108,7 +1131,7 @@ function Library:ImportLegacy(source, mapping)
         if raw == nil then
             skipped[#skipped + 1] = tostring(source)
         else
-            kind = string.lower(tostring(kind))
+            kind = string.lower(tostring(wanted))
             local converted
             if kind == "number" then
                 converted = tonumber(raw)
@@ -1501,7 +1524,15 @@ function Library:EnableGeometryPersistence(windows, options)
         windows = true
     end
     options = type(options) == "table" and options or {}
-    local targets = (windows == nil or windows == true) and nil or windows
+    -- nil is the internal spelling of "every window". Written as
+    -- `(cond and nil) or windows` the true branch falls through to `or` and
+    -- yields `true`, which matchesGeometryTargets then reads as a single target.
+    local targets
+    if windows == nil or windows == true then
+        targets = nil
+    else
+        targets = windows
+    end
     local count = 0
     for _, window in ipairs(self._windows) do
         if matchesGeometryTargets(targets, window) then
@@ -1927,6 +1958,13 @@ local DRAG_CONSUMING_CONTROLS = {
     AddColorPicker = true,
 }
 
+-- Control specs may name a control either way round: hand-written specs usually
+-- say "Toggle", while ExportSpec records the Section method name ("AddToggle")
+-- so that a spec it produced can be handed straight back to Build or AddRow.
+local function controlMethodName(controlType)
+    return string.sub(controlType, 1, 3) == "Add" and controlType or ("Add" .. controlType)
+end
+
 local Section = {}
 Section.__index = Section
 
@@ -2026,7 +2064,7 @@ function Section:AddRow(options)
     local function buildRowChild(index, childOptions, totalCount, window)
         local childType = childOptions.Type or childOptions.type or childOptions.Control
         childOptions.Type, childOptions.type, childOptions.Control = nil, nil, nil
-        local method = childType and Section["Add" .. tostring(childType)]
+        local method = childType and Section[controlMethodName(tostring(childType))]
         if type(method) ~= "function" then
             warn("[Bloodshot UI] AddRow: unknown control type " .. tostring(childType))
             return nil
@@ -2826,7 +2864,13 @@ function Section:AddKeybind(options)
     constrainText(keyButton, 8, 11)
     bindTheme(keyButton, "BackgroundColor3", "Background")
     corner(keyButton, 5)
-    local value = options.Default or Enum.KeyCode.Unknown
+    -- A key *name* is accepted as well as a KeyCode so a spec that came out of
+    -- ExportSpec (which stores enums as strings) can go straight back into Build.
+    local defaultKey = options.Default
+    if type(defaultKey) == "string" then
+        defaultKey = parseKeyName(defaultKey) or Enum.KeyCode.Unknown
+    end
+    local value = defaultKey or Enum.KeyCode.Unknown
     local mode = string.lower(tostring(options.Mode or "Press"))
     if mode ~= "press" and mode ~= "hold" and mode ~= "toggle" then mode = "press" end
     local active = false
@@ -2868,7 +2912,7 @@ function Section:AddKeybind(options)
         if key == nil or key == Enum.KeyCode.Unknown then
             return unboundText
         end
-        return mouseButtonNames[key] or key.Name
+        return mouseButtonNames[key] or key.Name or tostring(key)
     end
     local function set(nextValue, silent)
         if nextValue == nil or nextValue == Enum.KeyCode.Unknown then
@@ -3041,7 +3085,7 @@ function Section:AddColorPicker(options)
     local boxes = {}
     local value = options.Default or Color3.new(1, 1, 1)
     local defaultColor = value
-local alpha = math.clamp(tonumber(options.DefaultAlpha) or 1, 0, 1)
+    local alpha = math.clamp(tonumber(options.DefaultAlpha) or 1, 0, 1)
     local hue, saturation, brightness = value:ToHSV()
     local open = false
 
@@ -3055,7 +3099,7 @@ local alpha = math.clamp(tonumber(options.DefaultAlpha) or 1, 0, 1)
     end
     local presetColumns = math.clamp(math.floor(tonumber(options.PresetColumns) or 8), 1, 16)
     local presetRows = #presets > 0 and math.ceil(#presets / presetColumns) or 0
-local presetSwatches = {}
+    local presetSwatches = {}
     local presetArea = presetRows > 0 and presetRows * 20 + 6 or 0
     -- Presets only ever grow the panel downwards; the layout math below keys off
     -- this constant, so it has to include the swatch grid before anything is built.
@@ -3271,7 +3315,7 @@ local presetSwatches = {}
             connect(swatch.MouseLeave, function()
                 tween(swatch, 0.12, { BackgroundTransparency = 0 })
             end, self.Window._connections)
-            connect(swatch.Activated, function() set(preset) end, self.Window._connections)
+            connect(swatch.Activated, function() set(presets[index]) end, self.Window._connections)
             presetSwatches[index] = swatch
         end
     end
@@ -3351,10 +3395,6 @@ local presetSwatches = {}
             if not silent then safeCall(options.Callback, value, alpha) end
         end,
         GetDefault = function() return defaultColor end,
-        SetDefault = function(_, nextDefault)
-            if typeof(nextDefault) == "Color3" then defaultColor = nextDefault end
-            return control
-        end,
         Reset = function() set(defaultColor) end,
         IsOpen = function() return open end,
         SetOpen = function(_, nextOpen) setOpen(nextOpen) end,
@@ -3374,6 +3414,20 @@ local presetSwatches = {}
             return found
         end,
     }
+    -- Set here rather than in the literal above: a closure written inside a table
+    -- constructor cannot see the local being constructed on this Luau build, so
+    -- `return control` from inside the literal would come back nil.
+    control.SetDefault = function(self, nextDefault)
+        if typeof(nextDefault) == "Color3" then defaultColor = nextDefault end
+        return self
+    end
+    -- Same code path a swatch click runs, so a script can drive the palette from a
+    -- hotkey or a randomiser without reaching into the panel.
+    control.SetPreset = function(self, index)
+        local color = presets[index]
+        if typeof(color) == "Color3" then set(color) end
+        return self
+    end
     return control
 end
 
@@ -3567,7 +3621,10 @@ function Section:AddRangeSlider(options)
         Parent = self.Container,
     })
     new("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder, Parent = holder })
-    local nested = { Container = holder, Window = self.Window }
+    -- The two sliders are children of the holder, not of the section, but they still
+-- go through the enriched Section.Add* wrapper, which needs the same fields a
+-- real section has.
+local nested = { Container = holder, Window = self.Window, Tab = self.Tab, Controls = {} }
     local low, high
     local function publish(silent)
         local result = { low:Get(), high:Get() }
@@ -3916,32 +3973,10 @@ local function enrichControl(control, section, options, ownedConnections, method
     return control
 end
 
-for _, methodName in ipairs({
-    "AddLabel", "AddParagraph", "AddButton", "AddToggle", "AddSlider",
-    "AddInput", "AddDropdown", "AddKeybind", "AddColorPicker", "AddDivider",
-    "AddNumberInput", "AddRadio", "AddSegmented", "AddRangeSlider",
-    "AddRow", "AddSearch", "AddSummary", "AddList",
-}) do
-    local original = Section[methodName]
-    Section[methodName] = function(self, options)
-        local firstConnection = #self.Window._connections + 1
-        local control = original(self, options)
-        local ownedConnections = {}
-        for index = firstConnection, #self.Window._connections do
-            table.insert(ownedConnections, self.Window._connections[index])
-        end
-        control = enrichControl(control, self, options, ownedConnections, methodName)
-        if control then
-            table.insert(self.Controls, control)
-            -- Same reasoning as tabs/sections: without an explicit LayoutOrder
-            -- the section's UIListLayout would sort controls by Name.
-            if control.Instance then
-                control.Instance.LayoutOrder = #self.Controls
-            end
-        end
-        return control
-    end
-end
+-- NOTE: installControlWrappers must be invoked *after* every Section:Add* method
+-- is defined. A `function Section:AddFoo` assignment written later in the file
+-- replaces whatever wrapper this loop installed, and that control then silently
+-- skips the shared contract (no Destroy, no flag fan-out, not in Section.Controls).
 
 local Tab = {}
 Tab.__index = Tab
@@ -4163,12 +4198,21 @@ function Section:AddSearch(options)
     })
     local matches = 0
     local function run(query)
-        -- Re-apply the current query to pick up controls added since the last
-        -- keystroke; the snapshot keeps every match visible.
-        if target and target.Search and tostring(query or "") ~= "" then
-            matches = target:Search(query) or 0
+        query = tostring(query or "")
+        -- An empty query still has to go through Search: that is the restore path
+        -- which puts the controls the last filter hid back on screen. It returns
+        -- a visible count rather than a match count, so it is not kept.
+        if target and target.Search then
+            if query == "" then
+                target:Search("")
+                matches = 0
+            else
+                -- Re-apply the current query to pick up controls added since the
+                -- last keystroke; the snapshot keeps every match visible.
+                matches = target:Search(query) or 0
+            end
         end
-        if matches == 0 and string.lower(tostring(query or "")) ~= "" then
+        if matches == 0 and string.lower(query) ~= "" then
             nameLabel.Text = T("SearchNothingFound")
             nameLabel.TextColor3 = Library.Theme.Warning
         else
@@ -4177,7 +4221,7 @@ function Section:AddSearch(options)
         end
         icon.TextColor3 = matches > 0 and Library.Theme.Accent or Library.Theme.MutedText
         if not options.Flag then return end
-        Library.Flags[options.Flag] = tostring(query or "")
+        Library.Flags[options.Flag] = query
     end
     connect(box:GetPropertyChangedSignal("Text"), function()
         run(box.Text)
@@ -4575,6 +4619,39 @@ function Section:AddList(options)
     return list
 end
 
+-- Last of the Section:Add* definitions, so the shared v2 contract wrapper can be
+-- installed now (see the note above installControlWrappers).
+for _, methodName in ipairs({
+    "AddLabel", "AddParagraph", "AddButton", "AddToggle", "AddSlider",
+    "AddInput", "AddDropdown", "AddKeybind", "AddColorPicker", "AddDivider",
+    "AddNumberInput", "AddRadio", "AddSegmented", "AddRangeSlider",
+    "AddRow", "AddSearch", "AddSummary", "AddList",
+}) do
+    local original = Section[methodName]
+    Section[methodName] = function(self, options)
+        local firstConnection = #self.Window._connections + 1
+        local control = original(self, options)
+        local ownedConnections = {}
+        for index = firstConnection, #self.Window._connections do
+            table.insert(ownedConnections, self.Window._connections[index])
+        end
+        control = enrichControl(control, self, options, ownedConnections, methodName)
+        if control then
+            -- Composite controls build their children against a partial section
+            -- that only carries Container/Window; the list is created on demand so
+            -- those nested controls land somewhere harmless.
+            if type(self.Controls) ~= "table" then self.Controls = {} end
+            table.insert(self.Controls, control)
+            -- Same reasoning as tabs/sections: without an explicit LayoutOrder
+            -- the section's UIListLayout would sort controls by Name.
+            if control.Instance then
+                control.Instance.LayoutOrder = #self.Controls
+            end
+        end
+        return control
+    end
+end
+
 function Section:SetVisible(visible)
     if self.Frame then self.Frame.Visible = not not visible end
     return self
@@ -4666,7 +4743,13 @@ end
 
 -- Live count on the tab button, e.g. Tab:SetBadge("17 on"). nil or "" clears it.
 function Tab:SetBadge(value)
-    value = (value == nil or value == "") and nil or tostring(value)
+    -- `value == nil and nil or tostring(value)` would yield the *string* "nil":
+    -- the `and nil` branch falls through to the `or` fallback.
+    if value == nil or value == "" then
+        value = nil
+    else
+        value = tostring(value)
+    end
     self.BadgeValue = value
     if not self.Badge then
         if not value then return self end
@@ -4852,10 +4935,12 @@ Window.__index = Window
 
 -- Per-window convenience wrapper. Handlers always receive the window as their
 -- first argument, so the same handler can serve several windows.
--- Exposed as methods so callers drop self: Window:_subscribe stores the window
--- as the first handler argument, and _emit appends the event's own payload.
+-- No extra subscribe-time args are stored: every event this window raises goes
+-- through Window:_emit / Library:_emit("...", self, ...), so the emitter already
+-- supplies the window. Storing `self` here as well would hand handlers
+-- (window, window, payload).
 function Window:_subscribe(event, callback)
-    return Library:_subscribe(event, callback, self)
+    return Library:_subscribe(event, callback)
 end
 
 function Window:_emit(event, ...)
@@ -4889,13 +4974,15 @@ function Window:SetVisible(visible)
 end
 
 -- Fires whenever the active tab changes. Replaces polling window.ActiveTab.
+-- Handlers get (window, tab, previousTab).
 function Window:OnTabChanged(callback)
-    return Library:_subscribe("tabChanged", callback, self)
+    return self:_subscribe("tabChanged", callback)
 end
 
 -- Fires when the window is shown or hidden, so overlays can mirror its state.
+-- Handlers get (window, visible).
 function Window:OnVisibilityChanged(callback)
-    return Library:_subscribe("windowVisibility", callback, self)
+    return self:_subscribe("windowVisibility", callback)
 end
 
 function Window:GetSelectedTab()
@@ -5206,6 +5293,13 @@ function Window:EnableGeometryPersistence(options)
     end
     watch(self.Root, "Position")
     watch(self.Root, "Size")
+    -- Held on the watcher so Disable can drop them: these live on the library-wide
+    -- bus, so an enable/disable cycle that did not unbind would leave a dead
+    -- handler behind forever.
+    local busHandles = {
+        self:_subscribe("tabChanged", markDirty),
+        self:_subscribe("windowVisibility", markDirty),
+    }
     self._geometryWatcher = {
         Dirty = false,
         MarkDirty = markDirty,
@@ -5221,14 +5315,14 @@ function Window:EnableGeometryPersistence(options)
                 task.cancel(pending)
                 pending = nil
             end
+            for _, handle in ipairs(busHandles) do handle:Unbind() end
+            table.clear(busHandles)
             for _, connection in ipairs(connections) do
                 if connection.Connected then connection:Disconnect() end
             end
             table.clear(connections)
         end,
     }
-    self:_subscribe("tabChanged", markDirty)
-    self:_subscribe("windowVisibility", markDirty)
     if options.Load ~= false then
         Library:LoadGeometry()
     end
@@ -5677,7 +5771,10 @@ function Window:GetStats()
         Tabs = #self.Tabs,
         Sections = #self:GetSections(),
         PerType = perType,
-        Instances = self.Root and select(2, self.Root:GetDescendants()) or 0,
+        -- Counted with # rather than select(2, ...): Roblox hands back a
+        -- GetDescendants() table whose index 2 is nil, so skipping the first
+        -- entry that way silently produced 0.
+        Instances = self.Root and #self.Root:GetDescendants() or 0,
     }
 end
 
@@ -6407,6 +6504,36 @@ end
 
 -- Declarative UI construction. Defined at the end of the file so the
 -- Section/Window tables are already in scope.
+
+-- ExportSpec renders Color3 values as "#RRGGBB" so a spec stays JSON-friendly, so
+-- Build has to turn them back or a round-trip loses every colour.
+local function restoreColors(options, methodName)
+    if methodName == "AddColorPicker" then
+        local default = type(options.Default) == "string" and parseHexColor(options.Default) or nil
+        if default then options.Default = default end
+        if type(options.Presets) == "table" then
+            for index, preset in ipairs(options.Presets) do
+                if type(preset) == "string" then
+                    local color = parseHexColor(preset)
+                    if color then options.Presets[index] = color end
+                end
+            end
+        end
+    elseif methodName == "AddRow" and type(options.Controls) == "table" then
+        -- Row children are built by AddRow itself, so they are fixed up here
+        -- rather than by the recursive buildControl call.
+        for _, child in ipairs(options.Controls) do
+            if type(child) == "table" then
+                local childType = child.Type or child.type or child.Control
+                if type(childType) == "string" then
+                    restoreColors(child, controlMethodName(childType))
+                end
+            end
+        end
+    end
+    return options
+end
+
 local function buildControl(section, controlSpec, result)
     if type(controlSpec) ~= "table" then
         return nil
@@ -6414,23 +6541,39 @@ local function buildControl(section, controlSpec, result)
     local options = copyTable(controlSpec)
     local controlType = options.Type or options.type or options.Control
     options.Type, options.type, options.Control = nil, nil, nil
-    local children = options.Controls or options.controls
-    options.Controls, options.controls = nil, nil
     if type(controlType) ~= "string" then
         return nil, "Control spec needs a Type"
     end
-    local method = Section["Add" .. controlType]
+    local methodName = controlMethodName(controlType)
+    local method = Section[methodName]
     if type(method) ~= "function" then
         return nil, "Unknown control type: " .. tostring(controlType)
     end
+    restoreColors(options, methodName)
+    -- AddRow builds its own compact slots from the child specs. Recursing with
+    -- Section:Add* instead would stack full-width controls in the section and
+    -- lose the row layout, so those specs go straight to AddRow instead.
+    local nested = methodName ~= "AddRow"
+    local children = options.Controls or options.controls
+    if nested then options.Controls, options.controls = nil, nil end
     local control = method(section, options)
     local key = options.Flag or options.Name
     if key ~= nil then
         result.Controls[key] = control
     end
     if type(children) == "table" then
-        for _, childSpec in ipairs(children) do
-            buildControl(section, childSpec, result)
+        if nested then
+            for _, childSpec in ipairs(children) do
+                local child, err = buildControl(section, childSpec, result)
+                if not child then
+                    warn("[Bloodshot UI] Build: " .. tostring(err or "skipped a control"))
+                end
+            end
+        else
+            for _, child in ipairs(control.Children or {}) do
+                local childKey = child.Flag or child.Name
+                if childKey ~= nil then result.Controls[childKey] = child end
+            end
         end
     end
     return control
@@ -6515,6 +6658,9 @@ local SPEC_DROP = {
     Callback = true, Changed = true, Clear = true, Predicate = true,
     Resolve = true, Transform = true, TransformBack = true, OnError = true,
     Controls = true, OnClose = true, CloseRequest = true,
+    -- Live library references rather than spec data: AddSearch's Target points at
+    -- the tab/section it filters, which means nothing to whoever replays the spec.
+    Target = true,
 }
 
 -- Window -> spec, the inverse of Build. Lets an external tool mirror the exact
