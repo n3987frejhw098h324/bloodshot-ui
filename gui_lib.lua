@@ -13,7 +13,7 @@ local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 
 local Library = {
-    Version = "2.0.0",
+    Version = "2.1.0",
     ConfigVersion = 2,
     Flags = {},
     Theme = {
@@ -53,6 +53,10 @@ local Library = {
         NoOptions = "No options",
         ControlSearch = "control or section name",
         MadeWith = "Made with <3 by R",
+        Unbound = "Unbound",
+        PressAnyKey = "Press key...",
+        SearchNothingFound = "No matches",
+        AreYouSure = "Are you sure?",
     },
     _windows = {},
     _connections = {},
@@ -67,12 +71,82 @@ local Library = {
     _hooked = {},
     _bindings = {},
     _dependencySubs = {},
+    _controlDisposers = {},
+    _specControls = {},
     _windowOrder = {},
     _focusedWindow = nil,
     _gamepadEnabled = true,
     _autoSave = nil,
     _geometry = nil,
+    _listeners = {},
 }
+
+-- Generic subscribe/emit pair behind every Bloodshot event (tab changes,
+-- visibility, geometry, spec export). Listeners are copied before dispatch so a
+-- callback may unbind itself mid-emit, and errors never abort the fan-out.
+-- _subscribe remembers the emitter arguments, and _emit replays them before the
+-- emit-time arguments. Window:_subscribe stores `self` so every handler receives
+-- the window as its first argument regardless of how the event was raised.
+function Library:_subscribe(event, callback, ...)
+    if type(callback) ~= "function" then
+        return false, "Event handlers must be functions"
+    end
+    local listeners = self._listeners[event]
+    if not listeners then
+        listeners = {}
+        self._listeners[event] = listeners
+    end
+    local entry = { Callback = callback, Args = table.pack(...), Alive = true }
+    table.insert(listeners, entry)
+    return {
+        Event = event,
+        Unbind = function()
+            entry.Alive = false
+            for index, candidate in ipairs(listeners) do
+                if candidate == entry then
+                    table.remove(listeners, index)
+                    break
+                end
+            end
+            return true
+        end,
+    }
+end
+
+-- Emits to every handler on the bus. Args captured at subscribe time are passed
+-- first (this is how Window:_subscribe injects the window), followed by anything
+-- supplied at emit time.
+function Library:_emit(event, ...)
+    local listeners = self._listeners[event]
+    if not listeners then return 0 end
+    local snapshot = {}
+    for index, entry in ipairs(listeners) do
+        snapshot[index] = entry
+    end
+    local fired = 0
+    for _, entry in ipairs(snapshot) do
+        if entry.Alive then
+            fired += 1
+            -- pcall inlined rather than using safeCall: _emit is defined before
+            -- safeCall exists, so a safeCall call here would resolve to a global.
+            local ok, err = pcall(entry.Callback, table.unpack(entry.Args, 1, entry.Args.n), ...)
+            if not ok then
+                warn("[Bloodshot UI] " .. tostring(event) .. " listener error: " .. tostring(err))
+            end
+        end
+    end
+    return fired
+end
+
+-- Drops every handler for one event, or the whole table when event is nil.
+function Library:_clearListeners(event)
+    if event == nil then
+        table.clear(self._listeners)
+        return true
+    end
+    self._listeners[event] = nil
+    return true
+end
 
 -- User-facing copy lookup. Library:SetStrings overrides these per session.
 local function T(key)
@@ -326,12 +400,14 @@ end
 
 local function safeCall(callback, ...)
     if type(callback) ~= "function" then
-        return
+        return nil
     end
     local ok, message = pcall(callback, ...)
     if not ok then
         warn("[Bloodshot UI] Callback error: " .. tostring(message))
+        return nil
     end
+    return message
 end
 
 local function registerFlagSetter(window, flag, setter)
@@ -886,6 +962,188 @@ function Library:LoadConfig(json, options)
     return true
 end
 
+-- Reads a nested legacy config (the Rain/config.json shape: grouped maps, hex
+-- colour strings, key names) and flattens it onto Bloodshot flags.
+--   Bloodshot:ImportLegacy(json, {
+--       Sections = { CATEGORIES = "categories", VISUALS = "visuals" },
+--       Colors   = { VISUALS.tint = "tint" },
+--       Keys     = { KEYS.primary = "primaryBind" },
+--       Prefix   = "legacy.",
+--   })
+-- Section and key paths use dots ("VISUALS.tint"). Anything the mapping does not
+-- name is reported in the skipped list rather than silently dropped.
+local function legacyLookup(root, path)
+    local node = root
+    for part in string.gmatch(tostring(path), "[^%.]+") do
+        if type(node) ~= "table" then return nil end
+        node = node[part]
+    end
+    return node
+end
+
+local function parseHexColor(raw)
+    if type(raw) ~= "string" then return nil end
+    local hex = string.gsub(raw, "^#", "")
+    if hex:match("^%x%x%x%x%x%x$") then
+        return Color3.fromRGB(
+            tonumber(hex:sub(1, 2), 16),
+            tonumber(hex:sub(3, 4), 16),
+            tonumber(hex:sub(5, 6), 16)
+        )
+    end
+    if hex:match("^%x%x%x$") then
+        return Color3.fromRGB(
+            tonumber(hex:sub(1, 1), 16) * 17,
+            tonumber(hex:sub(2, 2), 16) * 17,
+            tonumber(hex:sub(3, 3), 16) * 17
+        )
+    end
+    return nil
+end
+
+local MOUSE_BUTTON_CODES = {
+    ["mouse1"] = Enum.UserInputType.MouseButton1,
+    ["mouse2"] = Enum.UserInputType.MouseButton2,
+    ["mouse3"] = Enum.UserInputType.MouseButton3,
+}
+
+local function parseKeyName(raw)
+    if typeof(raw) == "EnumItem" then return raw end
+    if type(raw) ~= "string" or raw == "" then return nil end
+    local lower = string.lower(raw)
+    if MOUSE_BUTTON_CODES[lower] then return MOUSE_BUTTON_CODES[lower] end
+    local named = string.gsub(raw, "^Enum%.KeyCode%.", "")
+    -- Roblox throws on an unknown member rather than returning nil.
+    local ok, code = pcall(function() return Enum.KeyCode[named] end)
+    if not ok or not code or code == Enum.KeyCode.Unknown then return nil end
+    return code
+end
+
+function Library:ImportLegacy(source, mapping)
+    mapping = type(mapping) == "table" and mapping or {}
+    local decoded = source
+    if type(source) == "string" then
+        local ok, result = pcall(HttpService.JSONDecode, HttpService, source)
+        if not ok or type(result) ~= "table" then
+            return nil, "ImportLegacy expects valid JSON or a table"
+        end
+        decoded = result
+    end
+    if type(decoded) ~= "table" then
+        return nil, "ImportLegacy expects valid JSON or a table"
+    end
+    local prefix = mapping.Prefix or ""
+    local applied = {}
+    local skipped = {}
+
+    local function write(flag, value)
+        applied[tostring(flag)] = value
+    end
+
+    for path, flag in pairs(type(mapping.Flags) == "table" and mapping.Flags or {}) do
+        local raw = legacyLookup(decoded, path)
+        if raw ~= nil then
+            write(prefix .. tostring(flag), raw)
+        else
+            skipped[#skipped + 1] = tostring(path)
+        end
+    end
+
+    -- Sections maps a legacy group to either:
+    --   true        copy every leaf under the group, keeping the leaf name
+    --   { key = flag }  copy just the named leaves, renaming each flag
+    local prefixSection = mapping.SectionPrefix
+    for sectionName, fields in pairs(type(mapping.Sections) == "table" and mapping.Sections or {}) do
+        local group = decoded[sectionName]
+        if type(group) ~= "table" then
+            skipped[#skipped + 1] = sectionName
+        elseif fields == true then
+            for key, value in pairs(group) do
+                local flag = prefix .. (prefixSection and (prefixSection .. "." .. tostring(key)) or tostring(key))
+                write(flag, value)
+            end
+        elseif type(fields) == "table" then
+            for key, flag in pairs(fields) do
+                local raw = legacyLookup(decoded, sectionName .. "." .. tostring(key))
+                if raw ~= nil then
+                    write(prefix .. tostring(flag), raw)
+                else
+                    skipped[#skipped + 1] = sectionName .. "." .. tostring(key)
+                end
+            end
+        end
+    end
+
+    for path, flag in pairs(type(mapping.Colors) == "table" and mapping.Colors or {}) do
+        local raw = legacyLookup(decoded, path)
+        local color = parseHexColor(raw)
+        if color then
+            write(prefix .. tostring(flag), color)
+        else
+            skipped[#skipped + 1] = tostring(path)
+        end
+    end
+
+    for path, flag in pairs(type(mapping.Keys) == "table" and mapping.Keys or {}) do
+        local raw = legacyLookup(decoded, path)
+        local key = parseKeyName(raw)
+        if key then
+            write(prefix .. tostring(flag), key)
+        else
+            skipped[#skipped + 1] = tostring(path)
+        end
+    end
+
+    -- Types coerces a copied value. The key is the target flag; the value is
+    -- either a kind string or { Kind, Source, Flag } for full control.
+    for flag, kind in pairs(type(mapping.Types) == "table" and mapping.Types or {}) do
+        local source = flag
+        local target = flag
+        if type(kind) == "table" then
+            kind = kind.Kind or kind.Type or kind[1]
+            source = kind.Source or flag
+            target = kind.Flag or flag
+        end
+        local raw = applied[source] or applied[target] or legacyLookup(decoded, source)
+        if raw == nil then
+            skipped[#skipped + 1] = tostring(source)
+        else
+            kind = string.lower(tostring(kind))
+            local converted
+            if kind == "number" then
+                converted = tonumber(raw)
+            elseif kind == "boolean" then
+                if type(raw) == "boolean" then
+                    converted = raw
+                elseif type(raw) == "string" then
+                    local lowered = string.lower(raw)
+                    converted = lowered == "true" or lowered == "1" or lowered == "on"
+                elseif type(raw) == "number" then
+                    converted = raw ~= 0
+                end
+            elseif kind == "string" then
+                converted = tostring(raw)
+            elseif kind == "color" then
+                converted = parseHexColor(raw)
+            elseif kind == "key" then
+                converted = parseKeyName(raw)
+            end
+            if converted ~= nil then
+                write(prefix .. tostring(target), converted)
+            else
+                skipped[#skipped + 1] = tostring(source)
+            end
+        end
+    end
+
+    local silent = mapping.Silent
+    for flag, value in pairs(applied) do
+        self:SetFlag(flag, value, silent)
+    end
+    table.sort(skipped)
+    return applied, skipped
+end
+
 function Library:SetConfigAdapter(adapter)
     if adapter ~= nil and type(adapter) ~= "table" then
         return false, "Config adapter must be a table"
@@ -1125,6 +1383,64 @@ function Library:SetGamepadEnabled(enabled)
     return self._gamepadEnabled
 end
 
+local function encodeGeometry(geometry)
+    local function encodeDim(dim)
+        return { dim.Scale, dim.Offset }
+    end
+    local entry = {
+        position = { encodeDim(geometry.Position.X), encodeDim(geometry.Position.Y) },
+        size = { encodeDim(geometry.Size.X), encodeDim(geometry.Size.Y) },
+        minimized = geometry.Minimized == true,
+        visible = geometry.Visible ~= false,
+    }
+    if geometry.Tab then entry.tab = tostring(geometry.Tab) end
+    if type(geometry.Scroll) == "table" then
+        entry.scroll = {}
+        for name, offset in pairs(geometry.Scroll) do
+            if typeof(offset) == "UDim2" then
+                entry.scroll[tostring(name)] = { encodeDim(offset.X), encodeDim(offset.Y) }
+            end
+        end
+    end
+    return entry
+end
+
+local function decodeGeometry(entry)
+    if type(entry) ~= "table" then return nil end
+    -- v2 payloads stored position/size as two flat 4-number arrays.
+    if type(entry[1]) == "table" and type(entry[2]) == "table" then
+        if #entry[1] == 4 and #entry[2] == 4 then
+            return {
+                Position = UDim2.new(entry[1][1], entry[1][2], entry[1][3], entry[1][4]),
+                Size = UDim2.new(entry[2][1], entry[2][2], entry[2][3], entry[2][4]),
+            }
+        end
+        return nil
+    end
+    if type(entry.position) ~= "table" or type(entry.size) ~= "table" then return nil end
+    local function dim(pair)
+        if type(pair) ~= "table" or type(pair[1]) ~= "table" or type(pair[2]) ~= "table" then
+            return nil
+        end
+        return UDim2.new(pair[1][1] or 0, pair[1][2] or 0, pair[2][1] or 0, pair[2][2] or 0)
+    end
+    local geometry = {
+        Position = dim(entry.position) or UDim2.new(0.5, 0, 0.5, 0),
+        Size = dim(entry.size) or UDim2.fromOffset(680, 470),
+        Minimized = entry.minimized == true,
+        Visible = entry.visible ~= false,
+    }
+    if entry.tab then geometry.Tab = tostring(entry.tab) end
+    if type(entry.scroll) == "table" then
+        geometry.Scroll = {}
+        for name, pair in pairs(entry.scroll) do
+            local offset = dim(pair)
+            if offset then geometry.Scroll[tostring(name)] = offset end
+        end
+    end
+    return geometry
+end
+
 function Library:SaveGeometry()
     local adapter = self._configAdapter
     if not adapter or type(adapter.Write) ~= "function" then
@@ -1134,16 +1450,7 @@ function Library:SaveGeometry()
     for _, window in ipairs(self._windows) do
         local geometry = window:GetGeometry()
         if geometry then
-            payload[window._geometryKey] = {
-                {
-                    geometry.Position.X.Scale, geometry.Position.X.Offset,
-                    geometry.Position.Y.Scale, geometry.Position.Y.Offset,
-                },
-                {
-                    geometry.Size.X.Scale, geometry.Size.X.Offset,
-                    geometry.Size.Y.Scale, geometry.Size.Y.Offset,
-                },
-            }
+            payload[window._geometryKey] = encodeGeometry(geometry)
         end
     end
     local ok, result = pcall(adapter.Write, adapter, "__geometry",
@@ -1169,18 +1476,66 @@ function Library:LoadGeometry()
     end
     local applied = 0
     for _, window in ipairs(self._windows) do
-        local entry = decoded.windows[window._geometryKey]
-        if type(entry) == "table" and type(entry[1]) == "table" and type(entry[2]) == "table"
-            and #entry[1] == 4 and #entry[2] == 4 then
-            if window:SetGeometry({
-                Position = UDim2.new(entry[1][1], entry[1][2], entry[1][3], entry[1][4]),
-                Size = UDim2.new(entry[2][1], entry[2][2], entry[2][3], entry[2][4]),
-            }) then
-                applied += 1
-            end
+        local geometry = decodeGeometry(decoded.windows[window._geometryKey])
+        if geometry and window:SetGeometry(geometry) then
+            applied += 1
         end
     end
     return true, applied
+end
+
+-- Opt-in automatic persistence. windows = true covers every window that exists
+-- now and any created later; a list of windows/keys applies only to those.
+local function matchesGeometryTargets(targets, window)
+    if targets == nil then return true end
+    if type(targets) == "table" and table.find(targets, window) then return true end
+    for _, key in ipairs(type(targets) == "table" and targets or { targets }) do
+        if window._geometryKey == tostring(key) then return true end
+    end
+    return false
+end
+
+function Library:EnableGeometryPersistence(windows, options)
+    if type(windows) == "table" and options == nil and (windows.Delay ~= nil or windows.Load ~= nil) then
+        options = windows
+        windows = true
+    end
+    options = type(options) == "table" and options or {}
+    local targets = (windows == nil or windows == true) and nil or windows
+    local count = 0
+    for _, window in ipairs(self._windows) do
+        if matchesGeometryTargets(targets, window) then
+            window:EnableGeometryPersistence(options)
+            count += 1
+        end
+    end
+    -- Windows built after this call opt in through the same setting.
+    if not self._geometryPersistenceHandle then
+        self._geometryPersistence = { Targets = targets, Options = options }
+        self._geometryPersistenceHandle = self:_subscribe("windowCreated", function(window)
+            local config = self._geometryPersistence
+            if config and matchesGeometryTargets(config.Targets, window) then
+                window:EnableGeometryPersistence(config.Options)
+            end
+        end)
+    else
+        self._geometryPersistence = { Targets = targets, Options = options }
+    end
+    return count
+end
+
+function Library:DisableGeometryPersistence(windows)
+    if self._geometryPersistenceHandle then
+        self._geometryPersistenceHandle:Unbind()
+        self._geometryPersistenceHandle = nil
+        self._geometryPersistence = nil
+    end
+    for _, window in ipairs(self._windows) do
+        if windows == nil or matchesGeometryTargets(windows, window) then
+            window:DisableGeometryPersistence()
+        end
+    end
+    return true
 end
 
 function Library:AutoSave(profile, options)
@@ -1400,24 +1755,60 @@ local function createControlBase(section, height, name, description)
         tween(holderStroke, 0.16, { Transparency = 0.45 })
     end, section.Window._connections)
 
-    local nameLabel = text(holder, name or "Control", 13, "Text", {
+    local compact = section._compact == true
+    local nameLabel = text(holder, name or "Control", compact and 11 or 13, "Text", {
         Position = UDim2.fromOffset(12, description and 8 or 0),
         Size = UDim2.new(1, -24, 0, description and 18 or height),
         Font = Enum.Font.GothamMedium,
     })
     local descriptionLabel
     if description then
-        descriptionLabel = text(holder, description, 11, "MutedText", {
+        descriptionLabel = text(holder, description, compact and 10 or 11, "MutedText", {
             Position = UDim2.fromOffset(12, 27),
             Size = UDim2.new(1, -24, 0, 16),
         })
     end
     holder:SetAttribute("BloodshotControl", true)
+    holder:SetAttribute("BloodshotCompact", compact)
     holder:SetAttribute("BloodshotDisabled", false)
     holder:SetAttribute("BloodshotBaseHeight", height)
     holder:SetAttribute("BloodshotHasDescription", description ~= nil)
     holder:SetAttribute("BloodshotNameLabel", nameLabel.Name)
     return holder, nameLabel, descriptionLabel
+end
+
+-- Row children are built through a lightweight nested section, so every Add*
+-- method works unchanged; this helper just post-processes the holder it produced.
+-- Controls that position their interactive parts with a fixed Y offset (slider
+-- tracks, dropdown panels) cannot survive a 30px row, so each such part is
+-- re-anchored to the vertical centre of the shorter row.
+local function compactifyControl(holder, rowHeight)
+    if not holder or not holder.Parent then return end
+    holder.Size = UDim2.new(1, 0, 1, 0)
+    holder:SetAttribute("BloodshotCompact", true)
+    local nameLabel
+    for _, child in ipairs(holder:GetChildren()) do
+        if not nameLabel and child:IsA("TextLabel") then
+            nameLabel = child
+        elseif child:IsA("GuiObject")
+            and child.AnchorPoint.Y == 0
+            and child.Position.Y.Scale == 0
+            and child.Size.Y.Scale == 0
+            and child.Size.Y.Offset > 0 then
+            if child.Size.Y.Offset >= rowHeight then
+                child.Size = UDim2.new(child.Size.X.Scale, child.Size.X.Offset, 0, rowHeight)
+            end
+            local centre = child.Position.Y.Offset + child.Size.Y.Offset / 2
+            child.AnchorPoint = Vector2.new(child.AnchorPoint.X, 0.5)
+            child.Position = UDim2.new(
+                child.Position.X.Scale,
+                child.Position.X.Offset,
+                0.5,
+                centre - rowHeight / 2
+            )
+        end
+    end
+    return nameLabel
 end
 
 -- Renumbers a UIListLayout-backed container so the given item lands at index.
@@ -1581,6 +1972,159 @@ function Section:MoveTo(index)
     return true
 end
 
+-- Compact multi-widget row. One section entry that lays several controls out
+-- side by side instead of stacking each one full width, which is what turns a
+-- 23-row catalogue into 23 rows instead of 92 stacked controls.
+--   section:AddRow({ Controls = {
+--       { Type = "Label", Name = "cloud" },
+--       { Type = "ColorPicker", Name = "tint" },
+--       { Type = "Toggle", Name = "icons" },
+--   } })
+-- Width accepts a number of pixels or a UDim2; the remainder is shared evenly.
+function Section:AddRow(options)
+    options = type(options) == "table" and options or { Controls = options }
+    local rowHeight = math.clamp(tonumber(options.Height) or 34, 24, 120)
+    local holder = new("Frame", {
+        Name = options.Name or "Row",
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ClipsDescendants = true,
+        Size = UDim2.new(1, 0, 0, rowHeight),
+        Parent = self.Container,
+    })
+    bindTheme(holder, "BackgroundColor3", "SurfaceAlt")
+    gradient(holder, "SurfaceAlt", "SurfaceGradient", 12)
+    corner(holder, 6)
+    stroke(holder, Library.Theme.Border, 1, 0.45, "Border")
+    holder:SetAttribute("BloodshotControl", true)
+    holder:SetAttribute("BloodshotRow", true)
+    holder:SetAttribute("BloodshotCompact", true)
+    holder:SetAttribute("BloodshotDisabled", false)
+    holder:SetAttribute("BloodshotBaseHeight", rowHeight)
+    holder:SetAttribute("BloodshotHasDescription", false)
+    tween(holder, 0.24, { BackgroundTransparency = Library.Theme.ControlTransparency or 0.8 })
+
+    local paddingLeft = options.Padding or 8
+    local strip = new("Frame", {
+        Name = "Strip",
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, -(paddingLeft * 2), 1, 0),
+        Position = UDim2.fromOffset(paddingLeft, 0),
+        Parent = holder,
+    })
+    new("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Padding = UDim.new(0, options.Spacing or 6),
+        VerticalAlignment = Enum.VerticalAlignment.Center,
+        Parent = strip,
+    })
+
+    -- Builds a child against its own slot frame. The slot is sized to the width
+    -- the caller asked for and full row height, and every control's holder is
+    -- rebuilt inside it, so a compact control can never escape its column.
+    local function buildRowChild(index, childOptions, totalCount, window)
+        local childType = childOptions.Type or childOptions.type or childOptions.Control
+        childOptions.Type, childOptions.type, childOptions.Control = nil, nil, nil
+        local method = childType and Section["Add" .. tostring(childType)]
+        if type(method) ~= "function" then
+            warn("[Bloodshot UI] AddRow: unknown control type " .. tostring(childType))
+            return nil
+        end
+        local weight = tonumber(childOptions.Weight)
+        local width = tonumber(childOptions.Width)
+        local slot = new("Frame", {
+            Name = "Slot" .. index,
+            BackgroundTransparency = 1,
+            Size = width and UDim2.fromOffset(width, rowHeight)
+                or UDim2.new((weight or 1) / totalCount, 0, 1, 0),
+            LayoutOrder = index,
+            Parent = strip,
+        })
+        -- Nested section: children delegate to the real Section metatable so
+        -- composite controls (NumberInput -> Input) keep working.
+        local child = setmetatable({
+            Container = slot,
+            Window = self.Window,
+            Tab = self.Tab,
+            _compact = true,
+            Controls = {},
+            _overlays = {},
+            Slot = slot,
+        }, { __index = Section })
+        local ok, result = pcall(method, child, childOptions)
+        if not ok or type(result) ~= "table" then
+            warn("[Bloodshot UI] AddRow: " .. tostring(result))
+            slot:Destroy()
+            return nil
+        end
+        compactifyControl(result.Instance, rowHeight)
+        result.Window = window
+        -- Section.Add* is the enriched wrapper, so the child already carries the full
+        -- control contract. It does not join section.Controls (those are the
+        -- direct children of the section container); row children are reached
+        -- through row.Children, and search walks the instance tree.
+        local childDestroy = result.Destroy
+        if type(childDestroy) == "function" then
+            result.Destroy = function(self, ...)
+                local ok, message = pcall(childDestroy, self, ...)
+                if slot.Parent then slot:Destroy() end
+                if not ok then error(message, 0) end
+            end
+        end
+        result.Slot = slot
+        if result.Type == nil then
+            result.Type = "Add" .. tostring(childType)
+            result.Spec = copyTable(childOptions)
+            result.Spec.Type = result.Type
+        end
+        return result
+    end
+
+    local children = {}
+    local specs = type(options.Controls) == "table" and options.Controls or {}
+    local total = math.max(1, #specs)
+    for index, spec in ipairs(specs) do
+        if type(spec) == "table" then
+            local childOptions = copyTable(spec)
+            childOptions.ReorderDrag = false
+            local child = buildRowChild(index, childOptions, total, self.Window)
+            if child then table.insert(children, child) end
+        end
+    end
+    -- Children were built against throwaway slots; reparent the finished holders
+    -- into one shared slot so weight-based widths apply to the whole row.
+    if #children > 0 then
+        for _, child in ipairs(children) do
+            if child.Instance and child.Instance.Parent then
+                child.Instance.Parent = strip
+            end
+        end
+    end
+
+    local row = {
+        Instance = holder,
+        Children = children,
+        RowHeight = rowHeight,
+        -- Row children carry their own specs, so a row round-trips through
+        -- ExportSpec/Build as one nested control.
+        Spec = copyTable(options),
+    }
+    row.Spec.Type = "AddRow"
+    row.Type = "AddRow"
+    row.Get = function(_, index)
+        return children[index or 1]
+    end
+    row.GetChild = row.Get
+    row.GetChildren = function() return children end
+    row.Set = function(_, index, value, silent)
+        local child = children[index]
+        if child and child.Set then child:Set(value, silent) end
+        return row
+    end
+    return row
+end
+
 function Section:AddLabel(options)
     options = type(options) == "table" and options or { Text = tostring(options) }
     local label = text(self.Container, options.Text or options.Name or "Label", options.TextSize or 12, options.Color or "MutedText", {
@@ -1635,7 +2179,7 @@ function Section:AddButton(options)
         Parent = holder,
     })
     nameLabel.Size = UDim2.new(1, -52, nameLabel.Size.Y.Scale, nameLabel.Size.Y.Offset)
-    local arrow = text(holder, "›", 22, "MutedText", {
+    local arrow = text(holder, "\u{203A}", 22, "MutedText", {
         AnchorPoint = Vector2.new(1, 0.5),
         Position = UDim2.new(1, -12, 0.5, 0),
         Size = UDim2.fromOffset(20, 24),
@@ -1649,13 +2193,41 @@ function Section:AddButton(options)
         ZIndex = 4,
         Parent = holder,
     })
+    local armed = false
+    local armTimer
+    local function disarm()
+        if armTimer then
+            task.cancel(armTimer)
+            armTimer = nil
+        end
+        if not armed then return end
+        armed = false
+        nameLabel.Text = tostring(options.Name or "Button")
+        nameLabel.TextColor3 = Library.Theme.Text
+        arrow.Text = "\u{203A}"
+        arrow.TextColor3 = Library.Theme.MutedText
+        tween(holder, 0.15, { BackgroundColor3 = Library.Theme.SurfaceAlt })
+    end
+    local function arm()
+        armed = true
+        nameLabel.Text = tostring(options.ConfirmText or (T("Confirm")))
+        nameLabel.TextColor3 = Library.Theme.Error
+        arrow.Text = "!"
+        tween(holder, 0.15, { BackgroundColor3 = Library.Theme.SurfaceAlt })
+        if armTimer then task.cancel(armTimer) end
+        armTimer = task.delay(options.ConfirmTimeout or 3, disarm)
+    end
     connect(button.MouseEnter, function()
-        tween(holder, 0.15, { BackgroundColor3 = Library.Theme.Border })
-        tween(arrow, 0.15, { Position = UDim2.new(1, -8, 0.5, 0) })
+        if not armed then
+            tween(holder, 0.15, { BackgroundColor3 = Library.Theme.Border })
+            tween(arrow, 0.15, { Position = UDim2.new(1, -8, 0.5, 0) })
+        end
     end, self.Window._connections)
     connect(button.MouseLeave, function()
-        tween(holder, 0.15, { BackgroundColor3 = Library.Theme.SurfaceAlt })
-        tween(arrow, 0.15, { Position = UDim2.new(1, -12, 0.5, 0) })
+        if not armed then
+            tween(holder, 0.15, { BackgroundColor3 = Library.Theme.SurfaceAlt })
+            tween(arrow, 0.15, { Position = UDim2.new(1, -12, 0.5, 0) })
+        end
     end, self.Window._connections)
     connect(button.Activated, function(input)
         ripple(holder, input and input.Position)
@@ -1664,14 +2236,30 @@ function Section:AddButton(options)
                 tween(buttonScale, 0.14, { Scale = 1 }, Enum.EasingStyle.Back)
             end
         end)
+        if options.Confirm == true then
+            if not armed then
+                arm()
+                return
+            end
+            disarm()
+        end
         safeCall(options.Callback)
     end, self.Window._connections)
-    return {
+    local control = {
         Instance = holder,
         Fire = function()
+            if options.Confirm == true and not armed then
+                arm()
+                return
+            end
+            disarm()
             safeCall(options.Callback)
         end,
+        IsArmed = function() return armed end,
+        Disarm = disarm,
     }
+    control.Arm = arm
+    return control
 end
 
 function Section:AddToggle(options)
@@ -2244,6 +2832,7 @@ function Section:AddKeybind(options)
     local active = false
     local listening = false
     local ignoreNextActivation = false
+    -- Declared before set()/keyName() below, which is where Default is captured.
     local mouseButtonNames = {
         [Enum.UserInputType.MouseButton1] = "Mouse 1",
         [Enum.UserInputType.MouseButton2] = "Mouse 2",
@@ -2261,17 +2850,40 @@ function Section:AddKeybind(options)
         return typeof(nextValue) == "EnumItem"
             and (nextValue.EnumType == Enum.KeyCode or mouseButtonNames[nextValue] ~= nil)
     end
+    local keyboardOnly = options.KeyboardOnly == true
+    local allowMouse = not keyboardOnly and options.AllowMouse ~= false
+    local cancelKey = options.CancelKey or Enum.KeyCode.Escape
+    local clearKeys = options.ClearKeys
+    if clearKeys == nil then
+        clearKeys = { Enum.KeyCode.Backspace, Enum.KeyCode.Delete }
+    elseif typeof(clearKeys) == "EnumItem" then
+        clearKeys = { clearKeys }
+    elseif type(clearKeys) ~= "table" then
+        clearKeys = {}
+    end
+    local unboundText = options.UnboundText or T("Unbound")
+    local captureText = options.CaptureText or T("PressAnyKey")
+
     local function keyName(key)
-        if key == Enum.KeyCode.Unknown then
-            return "None"
+        if key == nil or key == Enum.KeyCode.Unknown then
+            return unboundText
         end
         return mouseButtonNames[key] or key.Name
     end
     local function set(nextValue, silent)
-        if isSupported(nextValue) then value = nextValue end
+        if nextValue == nil or nextValue == Enum.KeyCode.Unknown then
+            value = Enum.KeyCode.Unknown
+        elseif isSupported(nextValue) then
+            value = nextValue
+        end
         keyButton.Text = keyName(value)
         if options.Flag then Library.Flags[options.Flag] = value end
         if not silent then safeCall(options.Changed, value) end
+    end
+    local function stopListening()
+        listening = false
+        keyButton.Text = keyName(value)
+        tween(keyButton, 0.15, { TextColor3 = Library.Theme.MutedText })
     end
     bindThemeState(keyButton, function()
         keyButton.TextColor3 = listening and Library.Theme.Accent or Library.Theme.MutedText
@@ -2282,16 +2894,32 @@ function Section:AddKeybind(options)
             return
         end
         listening = true
-        keyButton.Text = "Press key/mouse..."
+        keyButton.Text = captureText
         tween(keyButton, 0.15, { TextColor3 = Library.Theme.Accent })
     end, self.Window._connections)
-    connect(UserInputService.InputBegan, function(input, processed)
+    local function handleInput(input, processed)
         if listening then
             if input.UserInputType == Enum.UserInputType.Keyboard then
+                -- Cancel first: without this Escape would silently become the
+                -- binding, leaving no way out of capture.
+                if cancelKey and input.KeyCode == cancelKey then
+                    stopListening()
+                    return
+                end
+                if table.find(clearKeys, input.KeyCode) then
+                    listening = false
+                    if clearFunction then
+                        safeCall(clearFunction)
+                    else
+                        set(Enum.KeyCode.Unknown)
+                    end
+                    stopListening()
+                    return
+                end
                 listening = false
                 set(input.KeyCode)
                 tween(keyButton, 0.15, { TextColor3 = Library.Theme.MutedText })
-            elseif mouseButtonNames[input.UserInputType] then
+            elseif allowMouse and mouseButtonNames[input.UserInputType] then
                 listening = false
                 local point = input.Position
                 local topLeft = keyButton.AbsolutePosition
@@ -2304,6 +2932,7 @@ function Section:AddKeybind(options)
             end
             return
         end
+        if value == Enum.KeyCode.Unknown then return end
         local matches = value.EnumType == Enum.KeyCode
             and input.UserInputType == Enum.UserInputType.Keyboard
             and input.KeyCode == value
@@ -2318,9 +2947,11 @@ function Section:AddKeybind(options)
                 safeCall(options.Callback, value)
             end
         end
-    end, self.Window._connections)
+    end
+    connect(UserInputService.InputBegan, handleInput, self.Window._connections)
     connect(UserInputService.InputEnded, function(input)
         if mode ~= "hold" or not active then return end
+        if value == Enum.KeyCode.Unknown then return end
         local matches = value.EnumType == Enum.KeyCode
             and input.UserInputType == Enum.UserInputType.Keyboard
             and input.KeyCode == value
@@ -2332,11 +2963,33 @@ function Section:AddKeybind(options)
     end, self.Window._connections)
     registerFlagSetter(self.Window, options.Flag, set)
     set(value, true)
-    return {
+    local control = {
         Instance = holder,
         Set = function(_, nextValue, silent) set(nextValue, silent) end,
         Get = function() return value end,
+        -- Method form: HandleInput is called as control:HandleInput(input, processed),
+        -- so the leading self has to be dropped.
+        HandleInput = function(_, input, processed)
+            return handleInput(input, processed)
+        end,
         IsActive = function() return active end,
+        IsListening = function() return listening end,
+        IsBound = function() return value ~= Enum.KeyCode.Unknown end,
+        Clear = function()
+            listening = false
+            if clearFunction then
+                safeCall(clearFunction)
+            else
+                set(Enum.KeyCode.Unknown)
+            end
+            stopListening()
+        end,
+        StartCapture = function()
+            listening = true
+            keyButton.Text = captureText
+            tween(keyButton, 0.15, { TextColor3 = Library.Theme.Accent })
+        end,
+        StopCapture = function() stopListening() end,
         SetMode = function(_, nextMode)
             nextMode = string.lower(tostring(nextMode))
             if nextMode == "press" or nextMode == "hold" or nextMode == "toggle" then
@@ -2347,6 +3000,8 @@ function Section:AddKeybind(options)
             return false
         end,
     }
+    control.Unbind = control.Clear
+    return control
 end
 
 function Section:AddColorPicker(options)
@@ -2386,12 +3041,25 @@ function Section:AddColorPicker(options)
     local boxes = {}
     local value = options.Default or Color3.new(1, 1, 1)
     local defaultColor = value
-    local alpha = math.clamp(tonumber(options.DefaultAlpha) or 1, 0, 1)
-    local hexBox
+local alpha = math.clamp(tonumber(options.DefaultAlpha) or 1, 0, 1)
     local hue, saturation, brightness = value:ToHSV()
     local open = false
 
-    local PANEL_HEIGHT = 186
+    local presets = {}
+    if type(options.Presets) == "table" then
+        for _, candidate in ipairs(options.Presets) do
+            if typeof(candidate) == "Color3" then
+                presets[#presets + 1] = candidate
+            end
+        end
+    end
+    local presetColumns = math.clamp(math.floor(tonumber(options.PresetColumns) or 8), 1, 16)
+    local presetRows = #presets > 0 and math.ceil(#presets / presetColumns) or 0
+local presetSwatches = {}
+    local presetArea = presetRows > 0 and presetRows * 20 + 6 or 0
+    -- Presets only ever grow the panel downwards; the layout math below keys off
+    -- this constant, so it has to include the swatch grid before anything is built.
+    local PANEL_HEIGHT = 186 + presetArea
     local function placePanel()
         if not open then return end
         local rootFrame = self.Window.Root
@@ -2569,6 +3237,46 @@ function Section:AddColorPicker(options)
         if input.UserInputType == Enum.UserInputType.MouseButton1
             or input.UserInputType == Enum.UserInputType.Touch then hsvDragTarget = nil end
     end, self.Window._connections)
+    local presetHost
+    if presetRows > 0 then
+        presetHost = new("Frame", {
+            Name = "Presets",
+            Position = UDim2.new(0, 0, 0, 156),
+            Size = UDim2.new(1, 0, 0, presetArea),
+            BackgroundTransparency = 1,
+            Parent = panel,
+        })
+        new("UIListLayout", {
+            FillDirection = Enum.FillDirection.Horizontal,
+            Padding = UDim.new(0, 4),
+            SortOrder = Enum.SortOrder.LayoutOrder,
+            Parent = presetHost,
+        })
+        for index, preset in ipairs(presets) do
+            local swatch = new("TextButton", {
+                Name = "Preset" .. index,
+                BackgroundColor3 = preset,
+                BorderSizePixel = 0,
+                Size = UDim2.new(1 / presetColumns, -4, 0, 17),
+                AutoButtonColor = false,
+                Text = "",
+                LayoutOrder = index,
+                Parent = presetHost,
+            })
+            corner(swatch, 4)
+            stroke(swatch, Color3.new(1, 1, 1), 1, 0.55)
+            connect(swatch.MouseEnter, function()
+                tween(swatch, 0.12, { BackgroundTransparency = 0.15 })
+            end, self.Window._connections)
+            connect(swatch.MouseLeave, function()
+                tween(swatch, 0.12, { BackgroundTransparency = 0 })
+            end, self.Window._connections)
+            connect(swatch.Activated, function() set(preset) end, self.Window._connections)
+            presetSwatches[index] = swatch
+        end
+    end
+
+    local hexBox
     hexBox = new("TextBox", {
         Position = UDim2.new(0, 0, 1, -26),
         Size = options.Alpha == true and UDim2.new(0.5, -4, 0, 24) or UDim2.new(1, -80, 0, 24),
@@ -2597,15 +3305,20 @@ function Section:AddColorPicker(options)
             safeCall(options.Callback, value, alpha)
         end, self.Window._connections)
     end
-    local reset = new("TextButton", {
-        Position = UDim2.new(1, -72, 1, -26), Size = UDim2.fromOffset(72, 24),
-        BackgroundColor3 = Library.Theme.SurfaceAlt, BorderSizePixel = 0,
-        Text = T("Reset"), TextColor3 = Library.Theme.MutedText, Font = Enum.Font.GothamMedium,
-        TextSize = 10, ZIndex = 4, Parent = panel,
-    })
-    corner(reset, 4)
-    bindTheme(reset, "BackgroundColor3", "SurfaceAlt")
-    bindTheme(reset, "TextColor3", "MutedText")
+    local reset
+    if options.ResetButton ~= false then
+        reset = new("TextButton", {
+            Position = UDim2.new(1, -72, 1, -26), Size = UDim2.fromOffset(72, 24),
+            BackgroundColor3 = Library.Theme.SurfaceAlt, BorderSizePixel = 0,
+            Text = options.ResetText or T("Reset"), TextColor3 = Library.Theme.MutedText,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 10, ZIndex = 4, Parent = panel,
+        })
+        corner(reset, 4)
+        bindTheme(reset, "BackgroundColor3", "SurfaceAlt")
+        bindTheme(reset, "TextColor3", "MutedText")
+        connect(reset.Activated, function() set(defaultColor) end, self.Window._connections)
+    end
     connect(hexBox.FocusLost, function()
         local raw = hexBox.Text:gsub("#", "")
         if raw:match("^%x%x%x%x%x%x$") then
@@ -2614,7 +3327,6 @@ function Section:AddColorPicker(options)
             set(value, true)
         end
     end, self.Window._connections)
-    connect(reset.Activated, function() set(defaultColor) end, self.Window._connections)
     connect(preview.Activated, function()
         setOpen(not open)
     end, self.Window._connections)
@@ -2623,7 +3335,8 @@ function Section:AddColorPicker(options)
     end, self.Window._connections)
     registerFlagSetter(self.Window, options.Flag, set)
     set(value, true)
-    return {
+    panel.Size = UDim2.fromOffset(panel.Size.X.Offset, PANEL_HEIGHT)
+    local control = {
         Instance = holder,
         Set = function(_, nextValue, silent) set(nextValue, silent) end,
         Get = function() return value end,
@@ -2637,8 +3350,31 @@ function Section:AddColorPicker(options)
             if alphaBox then alphaBox.Text = tostring(math.floor(alpha * 100 + 0.5)) .. "%" end
             if not silent then safeCall(options.Callback, value, alpha) end
         end,
+        GetDefault = function() return defaultColor end,
+        SetDefault = function(_, nextDefault)
+            if typeof(nextDefault) == "Color3" then defaultColor = nextDefault end
+            return control
+        end,
         Reset = function() set(defaultColor) end,
+        IsOpen = function() return open end,
+        SetOpen = function(_, nextOpen) setOpen(nextOpen) end,
+        Presets = presets,
+        PresetColumns = presetColumns,
+        -- Preset swatches in creation order, plus the panel they live in. Read
+        -- from the tree too, because the grid is parented to the window root.
+        Swatches = presetSwatches,
+        Panel = panel,
+        GetPresets = function()
+            local host = panel:FindFirstChild("Presets")
+            if not host then return presetSwatches end
+            local found = {}
+            for _, child in ipairs(host:GetChildren()) do
+                if child:IsA("TextButton") then found[#found + 1] = child end
+            end
+            return found
+        end,
     }
+    return control
 end
 
 function Section:AddDivider(options)
@@ -2677,10 +3413,22 @@ function Section:AddNumberInput(options)
     if minimum > maximum then minimum, maximum = maximum, minimum end
     local increment = math.abs(tonumber(options.Increment) or 1)
     if increment == 0 or increment ~= increment then increment = 1 end
+    local prefix = options.Prefix
+    local suffix = options.Suffix
     local callback = options.Callback
+    local minimumScaled = math.floor(minimum / increment + 0.5) * increment
+    local maximumScaled = math.floor(maximum / increment + 0.5) * increment
+    local function normalize(raw)
+        local number = tonumber(raw)
+        if not number or number ~= number then return nil end
+        if number == math.huge or number == -math.huge then return nil end
+        if minimum == -math.huge then number = math.max(number, -1e15) end
+        if maximum == math.huge then number = math.min(number, 1e15) end
+        return math.clamp(math.floor(number / increment + 0.5) * increment, minimumScaled, maximumScaled)
+    end
     local mapped = copyTable(options)
     mapped.Numeric = true
-    mapped.Default = math.clamp(tonumber(options.Default) or 0, minimum, maximum)
+    mapped.Default = normalize(options.Default) or 0
     mapped.Callback = function(raw, enterPressed)
         local number = tonumber(raw)
         if not number or number ~= number then return end
@@ -2692,7 +3440,12 @@ function Section:AddNumberInput(options)
     local originalSet = input.Set
     function input:Set(value, silent)
         local number = tonumber(value)
-        if not number or number ~= number then return self end
+        if not number or number ~= number then
+            -- Revert-on-invalid: anything unparseable puts the last good value
+            -- back in the box instead of leaving the bad text on screen.
+            originalSet(self, tostring(input:Get() or 0), true)
+            return self
+        end
         number = math.clamp(math.floor(number / increment + 0.5) * increment, minimum, maximum)
         originalSet(self, tostring(number), silent)
         if options.Flag then Library.Flags[options.Flag] = number end
@@ -2707,6 +3460,25 @@ function Section:AddNumberInput(options)
         connect(box.FocusLost, function()
             input:Set(box.Text, true)
         end, self.Window._connections)
+        -- A number needs its affixes visible but must not have them typed into
+        -- the box, so they live in their own label beside it.
+        if prefix or suffix then
+            local affix = text(input.Instance, "", 11, "MutedText", {
+                AnchorPoint = Vector2.new(1, 0.5),
+                Position = UDim2.new(1, -12, 0.5, 0),
+                Size = UDim2.fromOffset(76, 26),
+                TextXAlignment = Enum.TextXAlignment.Right,
+            })
+            box.Position = UDim2.new(1, -94, 0.5, 0)
+            box.Size = UDim2.fromOffset(84, 28)
+            local adorn = function()
+                affix.Text = tostring(prefix or "") .. (box.Text or "") .. tostring(suffix or "")
+            end
+            adorn()
+            connect(box:GetPropertyChangedSignal("Text"), adorn, self.Window._connections)
+            connect(box.Focused, function() affix.TextTransparency = 0.6 end, self.Window._connections)
+            connect(box.FocusLost, function() affix.TextTransparency = 0 end, self.Window._connections)
+        end
     end
     input:Set(tonumber(options.Default) or 0, true)
     return input
@@ -2853,6 +3625,14 @@ local function enrichControl(control, section, options, ownedConnections, method
     local destroyed = false
     local flag = options.Flag
     local setter = flag and section.Window._flagSetters[flag]
+    -- Remembered so ExportSpec can rebuild a spec table from a live window.
+    -- AddRow children go through the same enriched Add* wrappers, so they land
+    -- here like every other control.
+    control.Type = methodName or control.Type
+    control.Flag = flag
+    control.Spec = copyTable(options or control.Spec)
+    control.Spec.Type = control.Type
+    table.insert(Library._specControls, control)
     for _, descendant in ipairs(instance:GetDescendants()) do
         if descendant:IsA("GuiButton") then
             descendant.Selectable = Library._gamepadEnabled ~= false
@@ -2911,42 +3691,86 @@ local function enrichControl(control, section, options, ownedConnections, method
         connect(instance.MouseLeave, hideTooltip, section.Window._connections)
     end
 
-    -- Optional dependency gating: the control only shows while every listed
-    -- flag is truthy. Search and Destroy both respect the result.
+    -- Optional dependency gating. DependsOn accepts a flag or list of flags (all
+    -- must be truthy), { Any = { ... } } for OR, { Predicate = fn } for arbitrary
+    -- logic, and { Not = true } to invert. Mode = "Disable" greys the control out
+    -- instead of hiding it.
     local dependency
     if options.DependsOn ~= nil then
         local deps = options.DependsOn
         if type(deps) == "string" then deps = { deps } end
-        if type(deps) == "table" and #deps > 0 then
-            dependency = { Deps = deps, Handles = {}, Met = true }
+        if type(deps) == "table" and (#deps > 0 or deps.Any or deps.Predicate or deps.Not) then
+            dependency = {
+                Deps = deps,
+                Handles = {},
+                Met = true,
+                Mode = options.DependencyMode == "Disable" and "Disable" or "Hide",
+            }
             local function satisfied()
-                for _, dep in ipairs(dependency.Deps) do
-                    if not Library:GetFlag(dep, false) then
-                        return false
+                if type(dependency.Deps.Predicate) == "function" then
+                    -- The predicate receives the current value of the flag named
+                    -- as its first argument, so it can express arbitrary logic.
+                    local ok, result = pcall(dependency.Deps.Predicate, function(flag)
+                        return Library:GetFlag(flag, false)
+                    end)
+                    return ok and result ~= false
+                end
+                local function any(flags)
+                    for _, dep in ipairs(flags) do
+                        if Library:GetFlag(dep, false) then return true end
+                    end
+                    return false
+                end
+                local met
+                if dependency.Deps.Any then
+                    met = any(dependency.Deps.Any)
+                else
+                    met = true
+                    for _, dep in ipairs(dependency.Deps) do
+                        if not Library:GetFlag(dep, false) then
+                            met = false
+                            break
+                        end
                     end
                 end
-                return true
+                if dependency.Deps.Not then met = not met end
+                return met
             end
             local function update()
                 if destroyed or not instance then return end
                 local met = satisfied()
                 dependency.Met = met
                 instance:SetAttribute("BloodshotDependencyMet", met)
-                if not met then
-                    instance.Visible = false
-                elseif not dependency.HiddenBySearch then
-                    instance.Visible = true
-                end
-                for _, descendant in ipairs(instance:GetDescendants()) do
-                    if descendant:IsA("GuiButton") or descendant:IsA("TextBox") then
-                        descendant.Selectable = met
+                if dependency.Mode == "Disable" then
+                    instance.Visible = not dependency.HiddenBySearch
+                    control.Disabled = not met
+                    instance:SetAttribute("BloodshotDisabled", not met)
+                    for _, descendant in ipairs(instance:GetDescendants()) do
+                        if descendant:IsA("GuiButton") or descendant:IsA("TextBox") then
+                            descendant.Active = met
+                            descendant.Selectable = met
+                        end
+                    end
+                else
+                    instance.Visible = met and not dependency.HiddenBySearch
+                    for _, descendant in ipairs(instance:GetDescendants()) do
+                        if descendant:IsA("GuiButton") or descendant:IsA("TextBox") then
+                            descendant.Selectable = met
+                        end
                     end
                 end
             end
             dependency.Update = update
-            for _, dep in ipairs(deps) do
-                table.insert(dependency.Handles, Library:OnFlagChanged(dep, update))
+            local function subscribe(list)
+                if type(list) ~= "table" then return end
+                for _, dep in ipairs(list) do
+                    if type(dep) == "string" then
+                        table.insert(dependency.Handles, Library:OnFlagChanged(dep, update))
+                    end
+                end
             end
+            subscribe(deps)
+            subscribe(deps.Any)
             update()
             control.SetDependency = function(_, newDependency)
                 for _, handle in ipairs(dependency.Handles) do handle:Unbind() end
@@ -2958,12 +3782,16 @@ local function enrichControl(control, section, options, ownedConnections, method
                     dependency.Met = true
                 else
                     dependency.Deps = list
-                    for _, dep in ipairs(list) do
-                        table.insert(dependency.Handles, Library:OnFlagChanged(dep, update))
-                    end
+                    subscribe(list)
+                    subscribe(list.Any)
                 end
                 update()
-                return self
+                return control
+            end
+            control.SetDependencyMode = function(_, mode)
+                dependency.Mode = mode == "Disable" and "Disable" or "Hide"
+                update()
+                return control
             end
             control.IsDependencyMet = function() return dependency.Met end
         end
@@ -3072,6 +3900,11 @@ local function enrichControl(control, section, options, ownedConnections, method
                 section.Window._flagSetters[flag] = nil
                 Library._flagTypes[flag] = nil
             end
+            for index = #Library._specControls, 1, -1 do
+                if Library._specControls[index] == control then
+                    table.remove(Library._specControls, index)
+                end
+            end
             if instance then instance:Destroy(); instance = nil end
             self.Instance = nil
         end
@@ -3087,6 +3920,7 @@ for _, methodName in ipairs({
     "AddLabel", "AddParagraph", "AddButton", "AddToggle", "AddSlider",
     "AddInput", "AddDropdown", "AddKeybind", "AddColorPicker", "AddDivider",
     "AddNumberInput", "AddRadio", "AddSegmented", "AddRangeSlider",
+    "AddRow", "AddSearch", "AddSummary", "AddList",
 }) do
     local original = Section[methodName]
     Section[methodName] = function(self, options)
@@ -3097,7 +3931,7 @@ for _, methodName in ipairs({
             table.insert(ownedConnections, self.Window._connections[index])
         end
         control = enrichControl(control, self, options, ownedConnections, methodName)
-        if self.Controls and not table.find(self.Controls, control) then
+        if control then
             table.insert(self.Controls, control)
             -- Same reasoning as tabs/sections: without an explicit LayoutOrder
             -- the section's UIListLayout would sort controls by Name.
@@ -3180,6 +4014,565 @@ function Tab:AddSection(options)
     section.CollapseButton = collapseButton
     section:SetCollapsed(options.Collapsed == true)
     return section
+end
+
+-- Collects everything a search should consider: whole controls, plus the
+-- children of AddRow holders, which are nested one level below a slot frame.
+local function collectSearchable(section)
+    local list = {}
+    local rows = {}
+    local function walk(node)
+        for _, child in ipairs(node:GetChildren()) do
+            if child:IsA("GuiObject") then
+                if child:GetAttribute("BloodshotControl")
+                    or child:GetAttribute("BloodshotList")
+                    or child:GetAttribute("BloodshotRow") then
+                    list[#list + 1] = child
+                    if child:GetAttribute("BloodshotRow") then
+                        rows[#rows + 1] = child
+                        walk(child)
+                    end
+                else
+                    walk(child)
+                end
+            end
+        end
+    end
+    walk(section.Container)
+    return list, rows
+end
+
+-- Filters one section in place. Returns the number of visible controls, or
+-- nil when nothing matched so callers can hide the whole section heading.
+local function filterSection(section, query)
+    local visible = 0
+    local all, rows = collectSearchable(section)
+    local matched = {}
+    for _, control in ipairs(all) do
+        if string.find(string.lower(control.Name), query, 1, true) ~= nil then
+            matched[control] = true
+        end
+    end
+    local function blocked(control)
+        if control:GetAttribute("BloodshotDependencyMet") == false then return true end
+        local parent = control.Parent
+        while parent and parent ~= section.Container do
+            if parent:GetAttribute("BloodshotDependencyMet") == false then return true end
+            parent = parent.Parent
+        end
+        return false
+    end
+    for _, control in ipairs(all) do
+        local isRow = control:GetAttribute("BloodshotRow") == true
+        local show
+        if isRow then
+            -- A row stays visible when its own name matches or any child does.
+            local anyChild = false
+            for _, child in ipairs(control:GetDescendants()) do
+                if child:IsA("GuiObject") and matched[child] then anyChild = true break end
+            end
+            show = matched[control] or anyChild
+        else
+            show = matched[control]
+        end
+        control.Visible = show and not blocked(control)
+        if control.Visible then visible += 1 end
+    end
+    return visible
+end
+
+-- Live search over one section's controls.
+function Section:Search(query)
+    query = string.lower(tostring(query or ""))
+    if not self.Container then return 0 end
+    -- Counts controls that pass the filter; on the restore path the snapshot is
+    -- authoritative, so only re-hide the ones a dependency still blocks.
+    if query == "" then
+        local snapshot = self._searchSnapshot
+        self._searchSnapshot = nil
+        if snapshot then
+            for _, entry in ipairs(snapshot.controls) do
+                if entry.instance.Parent then entry.instance.Visible = entry.visible end
+            end
+        end
+        local count = 0
+        for _, control in ipairs(collectSearchable(self)) do
+            local blocked = control:GetAttribute("BloodshotDependencyMet") == false
+                or (control.Parent and control.Parent.Parent
+                    and control.Parent.Parent:GetAttribute("BloodshotDependencyMet") == false)
+            if blocked then
+                control.Visible = false
+            elseif control.Visible then
+                count += 1
+            end
+        end
+        return count
+    end
+    if not self._searchSnapshot then
+        local controls = {}
+        for _, control in ipairs(collectSearchable(self)) do
+            controls[#controls + 1] = { instance = control, visible = control.Visible }
+        end
+        self._searchSnapshot = { controls = controls }
+    end
+    return filterSection(self, query)
+end
+
+function Section:AddSearch(options)
+    options = type(options) == "table" and options or {}
+    -- Defaults to the containing section. Pass Target = "Tab" (or a tab) to
+    -- filter the whole tab instead.
+    local target = self
+    if options.Target == "Tab" then
+        target = self.Tab
+    elseif options.Target ~= nil and options.Target ~= "Section" then
+        target = options.Target
+    end
+    local holder, nameLabel = createControlBase(
+        self,
+        40,
+        options.Name or T("SearchPlaceholder"),
+        options.Description
+    )
+    nameLabel.Size = UDim2.new(1, -170, 0, 40)
+    local box = new("TextBox", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -10, 0.5, 0),
+        Size = UDim2.fromOffset(options.Width or 152, 26),
+        BackgroundTransparency = 0,
+        BorderSizePixel = 0,
+        ClearTextOnFocus = false,
+        Font = Enum.Font.Gotham,
+        Text = "",
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        PlaceholderText = options.Placeholder or T("SearchPlaceholder"),
+        Parent = holder,
+    })
+    constrainText(box, 8, 11)
+    bindTheme(box, "BackgroundColor3", "Background")
+    bindTheme(box, "TextColor3", "Text")
+    bindTheme(box, "PlaceholderColor3", "MutedText")
+    corner(box, 5)
+    padding(box, 0, 8, 0, 8)
+    local icon = text(holder, "\u{1F50D}", 12, "MutedText", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -146, 0.5, 0),
+        Size = UDim2.fromOffset(14, 20),
+        TextXAlignment = Enum.TextXAlignment.Center,
+    })
+    local matches = 0
+    local function run(query)
+        -- Re-apply the current query to pick up controls added since the last
+        -- keystroke; the snapshot keeps every match visible.
+        if target and target.Search and tostring(query or "") ~= "" then
+            matches = target:Search(query) or 0
+        end
+        if matches == 0 and string.lower(tostring(query or "")) ~= "" then
+            nameLabel.Text = T("SearchNothingFound")
+            nameLabel.TextColor3 = Library.Theme.Warning
+        else
+            nameLabel.Text = options.Name or T("SearchPlaceholder")
+            nameLabel.TextColor3 = Library.Theme.Text
+        end
+        icon.TextColor3 = matches > 0 and Library.Theme.Accent or Library.Theme.MutedText
+        if not options.Flag then return end
+        Library.Flags[options.Flag] = tostring(query or "")
+    end
+    connect(box:GetPropertyChangedSignal("Text"), function()
+        run(box.Text)
+        if not options.Nofire then safeCall(options.Callback, box.Text, matches) end
+    end, self.Window._connections)
+    connect(box.Focused, function()
+        tween(box, 0.15, { BackgroundColor3 = Library.Theme.Surface })
+    end, self.Window._connections)
+    connect(box.FocusLost, function()
+        tween(box, 0.15, { BackgroundColor3 = Library.Theme.Background })
+    end, self.Window._connections)
+    return {
+        Instance = holder,
+        Set = function(_, query) box.Text = tostring(query or "") end,
+        Get = function() return box.Text end,
+        SetQuery = function(_, query)
+            box.Text = tostring(query or "")
+            run(box.Text)
+        end,
+        Clear = function() box.Text = "" end,
+        GetMatches = function() return matches end,
+    }
+end
+
+-- Live label whose text binds to flags. Placeholders {flag} in the template are
+-- replaced with the current value, so a callback does not have to call Set().
+--   section:AddSummary({ Template = "Icons {on}/23 | Outlines {out}/23" })
+-- Flags not named in the template can drive it through Values instead.
+function Section:AddSummary(options)
+    options = type(options) == "table" and options or {}
+    local template = options.Template or options.Text or ""
+    local holder = createControlBase(self, options.Height or 34, options.Name or "Summary")
+    local body = text(holder, "", options.TextSize or 12, options.Color or "Text", {
+        Position = UDim2.fromOffset(12, 0),
+        Size = UDim2.new(1, -24, 1, 0),
+        TextWrapped = true,
+        TextYAlignment = Enum.TextYAlignment.Center,
+        TextXAlignment = options.Alignment or Enum.TextXAlignment.Left,
+    })
+    local values = type(options.Values) == "table" and options.Values or {}
+    local handles = {}
+    local rendered = ""
+
+    local function render()
+        local function substitute(flag)
+            -- Values wins over a same-named flag so a placeholder can be
+            -- pointed at a different flag without renaming the template.
+            local mapped = values[flag]
+            if mapped ~= nil then flag = mapped end
+            local raw = Library:GetFlag(flag, nil)
+            if raw == nil then
+                return "?"
+            end
+            if typeof(raw) == "number" and math.floor(raw) ~= raw then
+                return tostring(math.floor(raw * 100 + 0.5) / 100)
+            end
+            return tostring(raw)
+        end
+        -- One pass: every {name} resolves through Values or falls back to being
+        -- a flag name. Two passes would double-substitute rendered values.
+        rendered = string.gsub(template, "{(%w[%w_%.]*)}", substitute)
+        body.Text = rendered
+    end
+
+    local function watch(flag)
+        if handles[flag] then return end
+        handles[flag] = Library:OnFlagChanged(flag, function()
+            render()
+            safeCall(options.Changed, rendered)
+        end)
+    end
+
+    local function collect()
+        for flag in string.gmatch(template, "{(%w[%w_%.]*)}") do
+            watch(flag)
+        end
+        for _, flag in pairs(values) do
+            watch(tostring(flag))
+        end
+    end
+    collect()
+
+    local entry = { Dispose = function()
+        for _, handle in pairs(handles) do handle:Unbind() end
+        table.clear(handles)
+    end }
+    table.insert(Library._controlDisposers, entry)
+    render()
+    return {
+        Instance = holder,
+        Set = function(_, value)
+            template = tostring(value)
+            collect()
+            render()
+        end,
+        Get = function() return rendered end,
+        Refresh = render,
+        Watch = function(_, flag, placeholder)
+            values[tostring(placeholder or flag)] = flag
+            watch(flag)
+            render()
+        end,
+        Unwatch = function(_, flag)
+            if handles[flag] then
+                handles[flag]:Unbind()
+                handles[flag] = nil
+                render()
+            end
+        end,
+    }
+end
+
+-- Runtime list of rows. Unlike the other controls this one owns no row specs up
+-- front: AddRow/Remove/Update drive it as data arrives, which is what effects
+-- managers and report previews need.
+--   local list = section:AddList({ MaxRows = 8 })
+--   list:AddRow({ Name = "Rain", Detail = "storm", Enabled = true })
+--   list:SetRows({ {Name = "a"}, {Name = "b"} })
+function Section:AddList(options)
+    options = type(options) == "table" and options or {}
+    local maxRows = math.clamp(math.floor(tonumber(options.MaxRows) or 8), 1, 200)
+    local rowHeight = math.clamp(tonumber(options.RowHeight) or 32, 20, 90)
+    local showIndex = options.ShowIndex == true
+    local holder = new("Frame", {
+        Name = options.Name or "List",
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ClipsDescendants = true,
+        Size = UDim2.new(1, 0, 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y,
+        Parent = self.Container,
+    })
+    bindTheme(holder, "BackgroundColor3", "SurfaceAlt")
+    gradient(holder, "SurfaceAlt", "SurfaceGradient", 12)
+    corner(holder, 6)
+    stroke(holder, Library.Theme.Border, 1, 0.45, "Border")
+    holder:SetAttribute("BloodshotControl", true)
+    holder:SetAttribute("BloodshotList", true)
+    holder:SetAttribute("BloodshotDisabled", false)
+    holder:SetAttribute("BloodshotBaseHeight", rowHeight)
+    holder:SetAttribute("BloodshotHasDescription", false)
+    padding(holder, 6, 6, 6, 6)
+    tween(holder, 0.24, { BackgroundTransparency = Library.Theme.ControlTransparency or 0.8 })
+
+    local heading
+    local rowHost = new("Frame", {
+        Name = "Rows",
+        Size = UDim2.new(1, 0, 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y,
+        Parent = holder,
+    })
+    if options.Title or options.Name then
+        heading = text(holder, options.Title or options.Name or "List", 12, "Text", {
+            Position = UDim2.fromOffset(6, 2),
+            Size = UDim2.new(1, -12, 0, 18),
+            Font = Enum.Font.GothamMedium,
+        })
+        rowHost.Position = UDim2.fromOffset(0, 24)
+    end
+    new("UIListLayout", {
+        Padding = UDim.new(0, 4),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Parent = rowHost,
+    })
+
+    local emptyLabel = text(rowHost, options.EmptyText or T("NoOptions"), 11, "MutedText", {
+        Size = UDim2.new(1, 0, 0, 24),
+        TextXAlignment = Enum.TextXAlignment.Center,
+    })
+    emptyLabel.Visible = true
+
+    local rows = {}
+
+    local function refreshEmpty()
+        emptyLabel.Visible = #rows == 0
+        holder:SetAttribute("BloodshotRowCount", #rows)
+        holder:SetAttribute("BloodshotRowCountText", tostring(#rows))
+        if options.Flag then
+            Library.Flags[options.Flag] = #rows
+        end
+    end
+
+    local function renderRow(entry, data, index)
+        entry.Data = data
+        entry.Label.Text = tostring(data.Name or data.Text or data.Title or "Row")
+        entry.Detail.Text = tostring(data.Detail or data.Description or "")
+        entry.Detail.Visible = entry.Detail.Text ~= ""
+        entry.Accent.BackgroundColor3 = data.Color or Library.Theme.Accent
+        entry.Accent.Visible = data.Color ~= nil or data.Dot == true
+        if showIndex then
+            entry.Index.Text = tostring(index)
+        end
+        if entry.Icon then
+            entry.Icon.Visible = data.Icon ~= nil
+            entry.Icon.Image = data.Icon
+        end
+        if entry.Remove then
+            entry.Remove.Visible = options.Removable ~= false
+        end
+    end
+
+    -- Forward declaration: makeRow's remove handler and SetRows both need the
+    -- finished control, and they are defined before it is assigned.
+    local list
+    local function makeRow(data, index)
+        local frame = new("Frame", {
+            Name = tostring(data.Key or data.Name or "Row"),
+            BackgroundTransparency = 0,
+            Size = UDim2.new(1, 0, 0, rowHeight),
+            BackgroundColor3 = Library.Theme.Background,
+            BorderSizePixel = 0,
+            LayoutOrder = index,
+            Parent = rowHost,
+        })
+        bindTheme(frame, "BackgroundColor3", "Background")
+        corner(frame, 5)
+        local accent = new("Frame", {
+            AnchorPoint = Vector2.new(0, 0.5),
+            Position = UDim2.fromOffset(6, 0.5),
+            Size = UDim2.fromOffset(4, rowHeight - 10),
+            BorderSizePixel = 0,
+            Visible = false,
+            Parent = frame,
+        })
+        corner(accent, 999)
+        local icon
+        local offset = 8
+        if options.ShowIcon == true then
+            icon = new("ImageLabel", {
+                BackgroundTransparency = 1,
+                AnchorPoint = Vector2.new(0, 0.5),
+                Position = UDim2.fromOffset(offset, 0.5),
+                Size = UDim2.fromOffset(18, 18),
+                Visible = false,
+                Parent = frame,
+            })
+            bindTheme(icon, "ImageColor3", "MutedText")
+            offset += 24
+        end
+        local indexLabel
+        if showIndex then
+            indexLabel = text(frame, "", 10, "MutedText", {
+                AnchorPoint = Vector2.new(0, 0.5),
+                Position = UDim2.fromOffset(offset, 0.5),
+                Size = UDim2.fromOffset(18, 18),
+                TextXAlignment = Enum.TextXAlignment.Left,
+            })
+            offset += 22
+        end
+        local label = text(frame, "", 11, "Text", {
+            AnchorPoint = Vector2.new(0, 0.5),
+            Position = UDim2.fromOffset(offset, 0.5),
+            Size = UDim2.new(0.45, 0, 0, rowHeight),
+            TextXAlignment = Enum.TextXAlignment.Left,
+        })
+        local detail = text(frame, "", 10, "MutedText", {
+            AnchorPoint = Vector2.new(0, 0.5),
+            Position = UDim2.fromOffset(offset + 4, 0.5),
+            Size = UDim2.new(0.3, 0, 0, rowHeight),
+            TextXAlignment = Enum.TextXAlignment.Left,
+        })
+        local remove
+        if options.Removable ~= false then
+            remove = text(frame, "\u{2715}", 12, "MutedText", {
+                AnchorPoint = Vector2.new(1, 0.5),
+                Position = UDim2.new(1, -8, 0.5, 0),
+                Size = UDim2.fromOffset(18, 20),
+                TextXAlignment = Enum.TextXAlignment.Center,
+            })
+            connect(remove.InputBegan, function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1
+                    or input.UserInputType == Enum.UserInputType.Touch then
+                    if not list:RemoveRow(entry.Key or entry.Label.Text) then
+                        list:Remove(entry.Data)
+                    end
+                end
+            end, self.Window._connections)
+        end
+        local entry = {
+            Instance = frame,
+            Label = label,
+            Detail = detail,
+            Accent = accent,
+            Icon = icon,
+            Index = indexLabel,
+            Remove = remove,
+            Data = data,
+        }
+        renderRow(entry, data, index)
+        return entry
+    end
+
+    local function indexOf(key)
+        for position, entry in ipairs(rows) do
+            if key ~= nil and entry.Data.Key == key then return position end
+            if key == nil and entry == key then return position end
+        end
+        return nil
+    end
+
+    list = {
+        Instance = holder,
+        Rows = rowHost,
+        MaxRows = maxRows,
+        RowHeight = rowHeight,
+        AddRow = function(self, data)
+            if type(data) ~= "table" then
+                return nil, "AddRow expects a table"
+            end
+            if #rows >= maxRows then
+                return nil, "List is full (" .. maxRows .. " rows)"
+            end
+            if data.Key ~= nil and indexOf(data.Key) then
+                return nil, "Duplicate row key"
+            end
+            local entry = makeRow(data, #rows + 1)
+            table.insert(rows, entry)
+            refreshEmpty()
+            local ok, message = pcall(function() safeCall(options.Callback, #rows, entry.Data, "add") end)
+            if not ok then warn("[Bloodshot UI] AddList callback: " .. tostring(message)) end
+            return entry
+        end,
+        Add = nil,
+        RemoveRow = function(self, key)
+            local position = indexOf(key)
+            if not position then return false end
+            local entry = table.remove(rows, position)
+            if entry and entry.Instance then entry.Instance:Destroy() end
+            for index, remaining in ipairs(rows) do
+                remaining.Instance.LayoutOrder = index
+                if remaining.Index then remaining.Index.Text = tostring(index) end
+            end
+            refreshEmpty()
+            safeCall(options.Callback, #rows, entry.Data, "remove")
+            return true
+        end,
+        UpdateRow = function(self, key, data)
+            if type(data) ~= "table" then return false end
+            local entry
+            for _, candidate in ipairs(rows) do
+                if candidate.Data.Key == key then entry = candidate break end
+            end
+            if not entry then return false end
+            local merged = {}
+            for field, value in pairs(entry.Data) do merged[field] = value end
+            for field, value in pairs(data) do merged[field] = value end
+            entry.Data = merged
+            renderRow(entry, merged, indexOf(entry) or 1)
+            safeCall(options.Callback, #rows, merged, "update")
+            return true
+        end,
+        GetRow = function(self, key)
+            local position = indexOf(key)
+            return position and rows[position] or nil
+        end,
+        GetRows = function() return rows end,
+        GetCount = function() return #rows end,
+        Clear = function(self)
+            for _, entry in ipairs(rows) do
+                if entry.Instance then entry.Instance:Destroy() end
+            end
+            table.clear(rows)
+            refreshEmpty()
+            safeCall(options.Callback, 0, nil, "clear")
+            return self
+        end,
+        SetRows = function(self, data)
+            -- Rebuild from scratch: keys, ordering and contents can all change.
+            local previous = self
+            list:Clear()
+            if type(data) == "table" then
+                for _, item in ipairs(data) do
+                    if type(item) == "table" then
+                        local ok = list:AddRow(item)
+                        if not ok then break end
+                    end
+                end
+            end
+            return previous
+        end,
+        Disposer = nil,
+    }
+    list.Add = list.AddRow
+    list.Remove = list.RemoveRow
+    list.Update = list.UpdateRow
+
+    list.Disposer = { Dispose = function()
+        for _, entry in ipairs(rows) do
+            if entry.Instance then entry.Instance:Destroy() end
+        end
+        table.clear(rows)
+    end }
+    table.insert(Library._controlDisposers, list.Disposer)
+    refreshEmpty()
+    return list
 end
 
 function Section:SetVisible(visible)
@@ -3265,7 +4658,67 @@ function Tab:SetDisabled(disabled)
     self.Button.Active = not self.Disabled
     self.Button.Selectable = not self.Disabled
     self.Button.TextTransparency = self.Disabled and 0.6 or 0
+    if self.Badge then
+        self.Badge.BackgroundTransparency = self.Disabled and 0.75 or 0.15
+    end
     return self
+end
+
+-- Live count on the tab button, e.g. Tab:SetBadge("17 on"). nil or "" clears it.
+function Tab:SetBadge(value)
+    value = (value == nil or value == "") and nil or tostring(value)
+    self.BadgeValue = value
+    if not self.Badge then
+        if not value then return self end
+        local badge = new("Frame", {
+            Name = "Badge",
+            AnchorPoint = Vector2.new(1, 0.5),
+            Position = UDim2.new(1, -10, 0.5, 0),
+            Size = UDim2.fromOffset(0, 0),
+            AutomaticSize = Enum.AutomaticSize.X,
+            BackgroundTransparency = 0.15,
+            BorderSizePixel = 0,
+            Parent = self.Button,
+        })
+        bindTheme(badge, "BackgroundColor3", "Accent")
+        corner(badge, 999)
+        local inner = new("UIPadding", {
+            PaddingLeft = UDim.new(0, 6),
+            PaddingRight = UDim.new(0, 6),
+            PaddingTop = UDim.new(0, 1),
+            PaddingBottom = UDim.new(0, 1),
+            Parent = badge,
+        })
+        local label = text(badge, "", 9, "Text", {
+            Size = UDim2.fromOffset(0, 14),
+            TextXAlignment = Enum.TextXAlignment.Center,
+            TextSize = 9,
+        })
+        self.Badge = badge
+        self.BadgePadding = inner
+        self.BadgeLabel = label
+    end
+    self.Badge.Visible = value ~= nil
+    if value ~= nil then self.BadgeLabel.Text = value end
+    -- The badge sits over the right edge, so the label has to give up that
+    -- space or a long tab name runs underneath it.
+    local base = self.Icon and ("      " .. self.Name) or ("   " .. self.Name)
+    if value ~= nil then
+        local width = #value
+        self.Button.Text = string.rep(" ", math.clamp(math.floor(width / 3) + 2, 3, 14)) .. base
+        self.Badge.BackgroundTransparency = self.Disabled and 0.75 or 0.15
+    else
+        self.Button.Text = base
+    end
+    return self
+end
+
+function Tab:GetBadge()
+    return self.BadgeValue
+end
+
+function Tab:ClearBadge()
+    return self:SetBadge(nil)
 end
 
 function Tab:Search(query)
@@ -3280,16 +4733,10 @@ function Tab:Search(query)
             for _, entry in ipairs(snapshot.sections) do
                 if entry.frame.Parent then entry.frame.Visible = entry.visible end
             end
-            for _, entry in ipairs(snapshot.controls) do
-                if entry.instance.Parent then entry.instance.Visible = entry.visible end
+            for _, section in ipairs(self.Sections) do
+                section:Search("")
             end
             for _, section in ipairs(self.Sections) do
-                for _, control in ipairs(section.Container:GetChildren()) do
-                    if control:IsA("GuiObject")
-                        and control:GetAttribute("BloodshotDependencyMet") == false then
-                        control.Visible = false
-                    end
-                end
                 if section.Frame.Visible then visibleCount += 1 end
             end
         else
@@ -3301,31 +4748,36 @@ function Tab:Search(query)
     end
 
     if not self._searchSnapshot then
-        local controls = {}
         local sections = {}
         for _, section in ipairs(self.Sections) do
             sections[#sections + 1] = { frame = section.Frame, visible = section.Frame.Visible }
-            for _, control in ipairs(section.Container:GetChildren()) do
-                if control:IsA("GuiObject") then
-                    controls[#controls + 1] = { instance = control, visible = control.Visible }
-                end
-            end
         end
-        self._searchSnapshot = { controls = controls, sections = sections }
+        self._searchSnapshot = { sections = sections }
     end
 
     local visibleCount = 0
     for _, section in ipairs(self.Sections) do
         local sectionMatch = string.find(string.lower(section.Name), query, 1, true) ~= nil
         local sectionVisible = sectionMatch
-        for _, control in ipairs(section.Container:GetChildren()) do
-            if control:IsA("GuiObject") then
-                local matches = sectionMatch
-                    or string.find(string.lower(control.Name), query, 1, true) ~= nil
-                local blocked = control:GetAttribute("BloodshotDependencyMet") == false
-                control.Visible = matches and not blocked
-                sectionVisible = sectionVisible or matches
+        if not sectionMatch then
+            -- Section name alone is not enough: a matching control anywhere in
+            -- the section keeps that section on screen with just its hits.
+            for _, control in ipairs(collectSearchable(section)) do
+                if string.find(string.lower(control.Name), query, 1, true) ~= nil then
+                    sectionVisible = true
+                    break
+                end
             end
+        end
+        if sectionMatch then
+            for _, control in ipairs(collectSearchable(section)) do
+                local blocked = control:GetAttribute("BloodshotDependencyMet") == false
+                    or (control.Parent and control.Parent.Parent
+                        and control.Parent.Parent:GetAttribute("BloodshotDependencyMet") == false)
+                control.Visible = not blocked
+            end
+        else
+            filterSection(section, query)
         end
         section.Frame.Visible = sectionVisible
         if sectionVisible then visibleCount += 1 end
@@ -3398,9 +4850,27 @@ end
 local Window = {}
 Window.__index = Window
 
+-- Per-window convenience wrapper. Handlers always receive the window as their
+-- first argument, so the same handler can serve several windows.
+-- Exposed as methods so callers drop self: Window:_subscribe stores the window
+-- as the first handler argument, and _emit appends the event's own payload.
+function Window:_subscribe(event, callback)
+    return Library:_subscribe(event, callback, self)
+end
+
+function Window:_emit(event, ...)
+    return Library:_emit(event, self, ...)
+end
+
+function Window:On(event, callback)
+    return self:_subscribe(event, callback)
+end
+
 function Window:SetVisible(visible)
     if self._destroyed then return end
-    self.Visible = not not visible
+    visible = not not visible
+    if self.Visible == visible then return end
+    self.Visible = visible
     if self.Visible then
         self.Root.Visible = true
         self._scale.Scale = 0.9
@@ -3414,6 +4884,22 @@ function Window:SetVisible(visible)
             if not self.Visible and self.Root then self.Root.Visible = false end
         end)
     end
+    if self._geometryWatcher then self._geometryWatcher.Dirty = true end
+    Library:_emit("windowVisibility", self, visible)
+end
+
+-- Fires whenever the active tab changes. Replaces polling window.ActiveTab.
+function Window:OnTabChanged(callback)
+    return Library:_subscribe("tabChanged", callback, self)
+end
+
+-- Fires when the window is shown or hidden, so overlays can mirror its state.
+function Window:OnVisibilityChanged(callback)
+    return Library:_subscribe("windowVisibility", callback, self)
+end
+
+function Window:GetSelectedTab()
+    return self.ActiveTab
 end
 
 function Window:GetTab(name)
@@ -3457,10 +4943,179 @@ function Window:SetSize(size)
     return true
 end
 
-function Window:SetToggleKey(input)
-    if typeof(input) ~= "EnumItem" then return false, "Toggle key must be an EnumItem" end
-    self._toggleKey = input
+-- Accepts a single EnumItem (old behaviour), a string like "LeftShift", or a
+-- combo descriptor so Shift+P-style toggles no longer need a hand-rolled
+-- UserInputService handler.
+--   window:SetToggleKey("LeftShift+P")            -- chord
+--   window:SetToggleKey({ "LeftControl", "M" })   -- any-of-modifier chord
+--   window:SetToggleKey({ Key = "P", Modifiers = {"LeftShift"}, Exact = true })
+local function normalizeModifier(key)
+    if type(key) == "string" then
+        local match = key:match("^Enum%.KeyCode%.(.+)$")
+        key = match or key
+        -- Unknown names must not throw out of window creation.
+        local ok, code = pcall(function() return Enum.KeyCode[key] end)
+        if not ok then return Enum.KeyCode.Unknown end
+        return code or Enum.KeyCode.Unknown
+    end
+    if typeof(key) == "EnumItem" then return key end
+    return Enum.KeyCode.Unknown
+end
+
+-- `combo` rather than `spec`: a parameter named spec would shadow the global
+-- type() used throughout this function.
+local function parseComboKey(combo)
+    if combo == nil then return nil end
+    if typeof(combo) == "EnumItem" then
+        return { Keys = { combo }, Modifiers = {}, RequireAll = true }
+    end
+    if type(combo) == "string" then
+        local parts = {}
+        for part in string.gmatch(combo, "[^+]+") do
+            parts[#parts + 1] = normalizeModifier((string.gsub(part, "^%s*(.-)%s*$", "%1")))
+        end
+        return { Keys = parts, Modifiers = {}, RequireAll = true, Label = combo }
+    end
+    if type(combo) ~= "table" then return nil end
+    local modifiers = {}
+    for _, modifier in ipairs(type(combo.Modifiers) == "table" and combo.Modifiers or {}) do
+        local resolved = normalizeModifier(modifier)
+        if resolved ~= Enum.KeyCode.Unknown then modifiers[#modifiers + 1] = resolved end
+    end
+    local keys = {}
+    local rawKeys = combo.Keys
+    if rawKeys == nil then rawKeys = combo.Key or combo.KeyCode end
+    if rawKeys == nil and combo[1] ~= nil then
+        -- A bare array is a chord: { "LeftControl", "M" }.
+        rawKeys = combo
+    end
+    if rawKeys ~= nil then
+        for _, entry in ipairs(type(rawKeys) == "table" and rawKeys or { rawKeys }) do
+            local resolved = normalizeModifier(entry)
+            if resolved ~= Enum.KeyCode.Unknown then keys[#keys + 1] = resolved end
+        end
+    end
+    if #keys == 0 then return nil end
+    return {
+        Keys = keys,
+        Modifiers = modifiers,
+        -- Any = true means holding one of the listed keys toggles; the default
+        -- requires the whole set pressed together as a chord.
+        RequireAll = combo.Any ~= true,
+        Exact = combo.Exact == true,
+        Label = combo.Label,
+    }
+end
+
+local function comboLabel(combo)
+    if not combo then return nil end
+    if combo.Label then return combo.Label end
+    local parts = {}
+    for _, modifier in ipairs(combo.Modifiers) do parts[#parts + 1] = modifier.Name end
+    for _, key in ipairs(combo.Keys) do parts[#parts + 1] = key.Name end
+    return table.concat(parts, "+")
+end
+
+local function comboMatches(combo, input, held)
+    local matched = false
+    for _, key in ipairs(combo.Keys) do
+        local hit = input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == key
+        if hit then matched = true break end
+    end
+    if not matched then return false end
+    if #combo.Keys > 1 and combo.RequireAll then
+        for _, key in ipairs(combo.Keys) do
+            if not held[key] then return false end
+        end
+    end
+    -- Modifiers are alternatives: holding any one of them satisfies the chord.
+    if #combo.Modifiers > 0 then
+        for _, modifier in ipairs(combo.Modifiers) do
+            if held[modifier] then return true end
+        end
+        return false
+    end
+    if combo.Exact then
+        for _, other in ipairs(held) do
+            local blocked = true
+            for _, key in ipairs(combo.Keys) do
+                if other == key then blocked = false break end
+            end
+            if blocked then
+                for _, modifier in ipairs(combo.Modifiers) do
+                    if other == modifier then blocked = false break end
+                end
+            end
+            if blocked then return false end
+        end
+    end
     return true
+end
+
+-- Tracks which keyboard keys are down so chord matching has state to read.
+local heldKeys = {}
+
+-- Holds a chord state so SetToggleKey combos can be matched without the
+-- signal. Same logic comboMatches uses on a real InputBegan.
+local function withHeldKeys(combo, key, modifiers, input)
+    local snapshot = {}
+    for held in pairs(heldKeys) do snapshot[held] = true end
+    for _, modifier in ipairs(modifiers or {}) do
+        local resolved = normalizeModifier(modifier)
+        heldKeys[resolved] = true
+    end
+    if key ~= nil then
+        local resolved = normalizeModifier(key)
+        if resolved == Enum.KeyCode.Unknown then
+            heldKeys = snapshot
+            return false
+        end
+        heldKeys[resolved] = true
+    end
+    local ok, matched = pcall(comboMatches, combo,
+        input or { UserInputType = Enum.UserInputType.Keyboard,
+                   KeyCode = normalizeModifier(key) },
+        heldKeys)
+    heldKeys = snapshot
+    return ok and matched or false
+end
+
+function Library:IsKeyHeld(key)
+    return heldKeys[normalizeModifier(key)] == true
+end
+
+function Library:GetHeldKeys()
+    local list = {}
+    for key, down in pairs(heldKeys) do
+        if down then list[#list + 1] = key end
+    end
+    table.sort(list, function(a, b) return a.Name < b.Name end)
+    return list
+end
+
+function Window:SetToggleKey(input)
+    local combo = parseComboKey(input)
+    if not combo then
+        return false, "Toggle key must be an EnumItem, a key name, or a combo descriptor"
+    end
+    self._toggleCombo = combo
+    self._toggleKey = combo.Keys[1]
+    return true, comboLabel(combo)
+end
+
+function Window:GetToggleKey()
+    return self._toggleCombo and comboLabel(self._toggleCombo) or nil
+end
+
+function Window:IsToggleCombo()
+    return self._toggleCombo ~= nil
+end
+
+-- Would this combo fire right now, given the keys/mods currently held? Lets a
+-- script (or a test) check a chord without waiting for a real key press.
+function Window:MatchesToggleKey(key, modifiers)
+    if not self._toggleCombo then return false end
+    return withHeldKeys(self._toggleCombo, key, modifiers)
 end
 
 function Window:SetTitle(title, subtitle)
@@ -3472,12 +5127,20 @@ end
 -- Persistence helpers used by SaveGeometry/LoadGeometry.
 function Window:GetGeometry()
     if self._destroyed or not self.Root then return nil end
-    return {
+    local geometry = {
         Position = self.Root.Position,
         Size = self._size,
         Minimized = self.Minimized,
         Visible = self.Visible,
+        Tab = self.ActiveTab and self.ActiveTab.Name or nil,
     }
+    for _, tab in ipairs(self.Tabs) do
+        if tab.Scroll and tab.Page then
+            geometry.Scroll = geometry.Scroll or {}
+            geometry.Scroll[tab.Name] = tab.Page.CanvasPosition
+        end
+    end
+    return geometry
 end
 
 function Window:SetGeometry(geometry)
@@ -3488,11 +5151,153 @@ function Window:SetGeometry(geometry)
     if typeof(geometry.Position) == "UDim2" then
         self.Root.Position = geometry.Position
     end
+    if geometry.Tab then
+        local tab = self._tabByName[tostring(geometry.Tab)]
+        if tab then self:SelectTab(tab) end
+    end
+    if geometry.Minimized == true then
+        self:SetMinimized(true)
+    elseif geometry.Minimized == false and self.Minimized then
+        self:SetMinimized(false)
+    end
+    if geometry.Visible ~= nil then
+        self:SetVisible(geometry.Visible == true)
+    end
+    if type(geometry.Scroll) == "table" then
+        for name, offset in pairs(geometry.Scroll) do
+            local tab = self._tabByName[tostring(name)]
+            if tab and tab.Page and typeof(offset) == "UDim2" then
+                tab.Page.CanvasPosition = offset
+            end
+        end
+    end
     return true
+end
+
+-- Opt-in automatic persistence. Marks the window dirty whenever its geometry,
+-- active tab, minimize state or visibility changes, then writes once the user
+-- stops interacting, so no polling loop over ActiveTab is needed.
+function Window:EnableGeometryPersistence(options)
+    options = type(options) == "table" and options or {}
+    if self._geometryWatcher then
+        self._geometryWatcher.Disconnect()
+        self._geometryWatcher = nil
+    end
+    if options == false or options.Enabled == false then
+        return false, "Geometry persistence disabled"
+    end
+    local delay = tonumber(options.Delay) or 1.5
+    if not delay or delay ~= delay or delay < 0 then delay = 1.5 end
+    local pending
+    local function flush()
+        pending = nil
+        Library:SaveGeometry()
+    end
+    local function markDirty()
+        if not self._geometryWatcher then return end
+        self._geometryWatcher.Dirty = true
+        if pending then task.cancel(pending) end
+        pending = task.delay(delay, flush)
+    end
+    local connections = {}
+    local function watch(object, property)
+        local connection = object:GetPropertyChangedSignal(property):Connect(markDirty)
+        table.insert(connections, connection)
+    end
+    watch(self.Root, "Position")
+    watch(self.Root, "Size")
+    self._geometryWatcher = {
+        Dirty = false,
+        MarkDirty = markDirty,
+        Flush = function()
+            if pending then
+                task.cancel(pending)
+                pending = nil
+            end
+            flush()
+        end,
+        Disconnect = function()
+            if pending then
+                task.cancel(pending)
+                pending = nil
+            end
+            for _, connection in ipairs(connections) do
+                if connection.Connected then connection:Disconnect() end
+            end
+            table.clear(connections)
+        end,
+    }
+    self:_subscribe("tabChanged", markDirty)
+    self:_subscribe("windowVisibility", markDirty)
+    if options.Load ~= false then
+        Library:LoadGeometry()
+    end
+    return true
+end
+
+function Window:DisableGeometryPersistence()
+    if not self._geometryWatcher then return false end
+    self._geometryWatcher.Disconnect()
+    self._geometryWatcher = nil
+    return true
+end
+
+function Window:IsGeometryPersistenceEnabled()
+    return self._geometryWatcher ~= nil
+end
+
+function Window:SaveGeometryNow()
+    if self._geometryWatcher then
+        return self._geometryWatcher.Flush()
+    end
+    return Library:SaveGeometry()
 end
 
 function Window:Toggle()
     self:SetVisible(not self.Visible)
+end
+
+-- Installs (or with nil, removes) the close handler. Returning false from it
+-- keeps the window open, which is what a "Keep Raining?" confirmation needs.
+function Window:SetOnClose(callback)
+    if callback ~= nil and type(callback) ~= "function" then
+        return false, "OnClose must be a function"
+    end
+    self._onClose = callback
+    return true
+end
+
+-- Runs the close flow. CloseRequest decides *whether* to close (a confirmation
+-- dialog that resolves later calls RequestClose again); OnClose decides what
+-- closing means and runs after the window has actually closed.
+function Window:RequestClose()
+    if self._destroyed then return false end
+    if self._closeRequest then
+        local handled = safeCall(self._closeRequest, self)
+        if handled ~= false and handled ~= true then
+            -- The handler took ownership and will call RequestClose again.
+            return false
+        end
+        if handled == false then
+            return false
+        end
+    end
+    self:_finishClose()
+    return true
+end
+
+function Window:_finishClose()
+    if self._destroyed then return end
+    local onClose = self._onClose
+    if self._destroyOnClose then
+        self:Destroy()
+    else
+        self:SetVisible(false)
+    end
+    if onClose then
+        safeCall(onClose, self)
+        Library:_emit("windowClosed", self)
+    end
 end
 
 -- The window's intended pixel size, independent of any in-flight scale tween.
@@ -3576,8 +5381,9 @@ function Window:SelectTab(tab)
         tab = self._tabByName[tab]
     end
     if not tab or tab.Disabled or self.ActiveTab == tab then return end
-    if self.ActiveTab then
-        self.ActiveTab.Page.Visible = false
+    local previous = self.ActiveTab
+    if previous then
+        previous.Page.Visible = false
         tween(self.ActiveTab.Button, 0.15, {
             BackgroundTransparency = 1,
             TextColor3 = Library.Theme.MutedText,
@@ -3606,6 +5412,8 @@ function Window:SelectTab(tab)
     if tab.Image then
         tween(tab.Image, 0.15, { ImageColor3 = Library.Theme.Accent })
     end
+    if self._geometryWatcher then self._geometryWatcher.Dirty = true end
+    Library:_emit("tabChanged", self, tab, previous)
 end
 
 function Window:AddTab(name, icon)
@@ -3691,6 +5499,9 @@ function Window:AddTab(name, icon)
         Window = self,
         Sections = {},
         Disabled = false,
+        Icon = icon,
+        Badge = nil,
+        BadgeValue = nil,
     }, Tab)
     bindThemeState(button, function()
         button.BackgroundColor3 = Library.Theme.SurfaceAlt
@@ -3812,6 +5623,62 @@ function Window:GetSections()
         end
     end
     return list
+end
+
+-- Walks every control holder in the window, descending into AddRow children, so
+-- the counts behind #19 can be checked at any window size.
+local function collectWindowControls(window)
+    local controls = {}
+    local function walk(node)
+        for _, child in ipairs(node:GetChildren()) do
+            if child:IsA("GuiObject") then
+                if child:GetAttribute("BloodshotControl")
+                    or child:GetAttribute("BloodshotList")
+                    or child:GetAttribute("BloodshotRow") then
+                    controls[#controls + 1] = child
+                    -- Row children are real controls too, so they count
+                    -- separately from the row that holds them.
+                    if child:GetAttribute("BloodshotRow") then walk(child) end
+                else
+                    walk(child)
+                end
+            end
+        end
+    end
+    for _, tab in ipairs(window.Tabs) do
+        if tab.Page then walk(tab.Page) end
+    end
+    return controls
+end
+
+-- Per-window control statistics. ~130 controls in one window is the documented
+-- supported ceiling, so this is how a script confirms it is under it.
+function Window:GetControlCount()
+    if self._destroyed then return 0 end
+    return #collectWindowControls(self)
+end
+
+function Window:GetStats()
+    if self._destroyed then return nil end
+    local controls = collectWindowControls(self)
+    local perType = {}
+    local function bump(name)
+        perType[name] = (perType[name] or 0) + 1
+    end
+    for _, control in ipairs(controls) do
+        bump(control:GetAttribute("BloodshotList") and "List"
+            or control:GetAttribute("BloodshotRow") and "Row"
+            or control:GetAttribute("BloodshotBaseHeight") and "Control"
+            or "Other")
+    end
+    return {
+        Controls = #controls,
+        Focusables = #self:GetFocusables(),
+        Tabs = #self.Tabs,
+        Sections = #self:GetSections(),
+        PerType = perType,
+        Instances = self.Root and select(2, self.Root:GetDescendants()) or 0,
+    }
 end
 
 function Window:GetFocusables()
@@ -3943,6 +5810,8 @@ function Library:CreateWindow(options)
         math.clamp(minimumSize.Y, 180, 2160)
     )
     local minimizedWidth = math.clamp(tonumber(options.MinimizedWidth) or 320, 220, 480)
+    local toggleCombo = parseComboKey(options.ToggleKey or Enum.KeyCode.RightShift)
+        or parseComboKey(Enum.KeyCode.RightShift)
     local connections = {}
     local root = new("Frame", {
         Name = options.Title or "Bloodshot",
@@ -4180,23 +6049,28 @@ function Library:CreateWindow(options)
         Position = UDim2.fromOffset(18, titleTop + 22),
         Size = UDim2.new(1, -140, 0, 16),
     })
-    local close = new("TextButton", {
-        AnchorPoint = Vector2.new(1, 0.5),
-        Position = UDim2.new(1, -14, 0.5, 0),
-        Size = UDim2.fromOffset(30, 30),
-        BackgroundColor3 = Library.Theme.SurfaceAlt,
-        BackgroundTransparency = 1,
-        BorderSizePixel = 0,
-        AutoButtonColor = false,
-        Font = Enum.Font.GothamMedium,
-        Text = "X",
-        TextColor3 = Library.Theme.MutedText,
-        TextSize = 20,
-        Parent = topbar,
-    })
-    bindTheme(close, "BackgroundColor3", "SurfaceAlt")
-    bindTheme(close, "TextColor3", "MutedText")
-    corner(close, 6)
+    local closeButton
+    if options.Closeable ~= false then
+        closeButton = new("TextButton", {
+            AnchorPoint = Vector2.new(1, 0.5),
+            Position = UDim2.new(1, -14, 0.5, 0),
+            Size = UDim2.fromOffset(30, 30),
+            BackgroundColor3 = Library.Theme.SurfaceAlt,
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            AutoButtonColor = false,
+            Font = Enum.Font.GothamMedium,
+            Text = "X",
+            TextColor3 = Library.Theme.MutedText,
+            TextSize = 20,
+            Parent = topbar,
+        })
+    end
+    if closeButton then
+        bindTheme(closeButton, "BackgroundColor3", "SurfaceAlt")
+        bindTheme(closeButton, "TextColor3", "MutedText")
+        corner(closeButton, 6)
+    end
     local minimize
     if options.MinimizeButton ~= false then
         minimize = new("TextButton", {
@@ -4316,6 +6190,7 @@ function Library:CreateWindow(options)
         TabList = tabList,
         Pages = pages,
         MinimizeButton = minimize,
+        CloseButton = closeButton,
         Tabs = {},
         ActiveTab = nil,
         Visible = true,
@@ -4335,6 +6210,22 @@ function Library:CreateWindow(options)
             SidebarHorizontal = sidebarHorizontal,
             SectionSpacing = sectionSpacing,
             ControlSpacing = controlSpacing,
+            SidebarWidth = sidebarWidth,
+            SidebarHeight = sidebarHeight,
+            TopbarHeight = topbarHeight,
+            ContentPadding = contentPadding,
+            SidebarPadding = sidebarPadding,
+            TabSpacing = tabSpacing,
+            MinimumSize = minimumSize,
+            MinimizedWidth = minimizedWidth,
+            SidebarSide = sidebarOnRight and "Right"
+                or sidebarOnBottom and "Bottom"
+                or sidebarOnTop and "Top"
+                or "Left",
+            Resizable = options.Resizable ~= false,
+            CornerRadius = options.CornerRadius or 10,
+            AnimatedBackground = options.AnimatedBackground == true,
+            BackgroundParticles = options.BackgroundParticles == true,
         },
         _connections = connections,
         _flagSetters = {},
@@ -4342,14 +6233,19 @@ function Library:CreateWindow(options)
         _tabByName = {},
         _titleLabel = titleLabel,
         _subtitleLabel = subtitleLabel,
-        _toggleKey = options.ToggleKey or Enum.KeyCode.RightShift,
         _tabsReorderable = options.ReorderableTabs ~= false,
         _reorderEnabled = options.Reorderable ~= false,
         _themeOverrides = nil,
+        _onClose = type(options.OnClose) == "function" and options.OnClose or nil,
+        _closeRequest = type(options.CloseRequest) == "function" and options.CloseRequest or nil,
+        _destroyOnClose = options.DestroyOnClose == true,
+        _toggleCombo = toggleCombo,
+        _toggleKey = toggleCombo.Keys[1],
         _geometryKey = tostring(options.GeometryKey or sanitizeProfileName(options.Title or ("window" .. #self._windows))),
     }, Window)
     table.insert(self._windows, window)
     table.insert(self._windowOrder, window)
+    Library:_emit("windowCreated", window)
     -- A new window opens in front, otherwise it lands behind every window that
     -- already exists and the one you just made looks like it vanished.
     self:FocusWindow(window, false)
@@ -4400,21 +6296,23 @@ function Library:CreateWindow(options)
         end, connections)
         window.ResizeHandle = resizeHandle
     end
-    connect(close.MouseEnter, function()
-        tween(close, 0.15, {
-            BackgroundTransparency = 0,
-            TextColor3 = Library.Theme.Error,
-        })
-    end, connections)
-    connect(close.MouseLeave, function()
-        tween(close, 0.15, {
-            BackgroundTransparency = 1,
-            TextColor3 = Library.Theme.MutedText,
-        })
-    end, connections)
-    connect(close.Activated, function()
-        if options.DestroyOnClose then window:Destroy() else window:SetVisible(false) end
-    end, connections)
+    if closeButton then
+        connect(closeButton.MouseEnter, function()
+            tween(closeButton, 0.15, {
+                BackgroundTransparency = 0,
+                TextColor3 = Library.Theme.Error,
+            })
+        end, connections)
+        connect(closeButton.MouseLeave, function()
+            tween(closeButton, 0.15, {
+                BackgroundTransparency = 1,
+                TextColor3 = Library.Theme.MutedText,
+            })
+        end, connections)
+        connect(closeButton.Activated, function()
+            window:RequestClose()
+        end, connections)
+    end
     if minimize then
         connect(minimize.MouseEnter, function()
             tween(minimize, 0.15, {
@@ -4433,8 +6331,22 @@ function Library:CreateWindow(options)
         end, connections)
     end
 
+    connect(UserInputService.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.Keyboard then
+            heldKeys[input.KeyCode] = true
+        end
+    end, connections)
+    connect(UserInputService.InputEnded, function(input)
+        if input.UserInputType == Enum.UserInputType.Keyboard then
+            heldKeys[input.KeyCode] = nil
+        end
+    end, connections)
+    connect(UserInputService.WindowFocusReleased, function()
+        table.clear(heldKeys)
+    end, connections)
     connect(UserInputService.InputBegan, function(input, processed)
-        if not processed and (input.KeyCode == window._toggleKey or input.UserInputType == window._toggleKey) then
+        if processed then return end
+        if comboMatches(toggleCombo, input, heldKeys) then
             window:Toggle()
         end
     end, connections)
@@ -4473,8 +6385,13 @@ function Library:Destroy()
     for index = #self._windows, 1, -1 do
         self._windows[index]:Destroy()
     end
+    -- Windows are torn down above, which also empties _windowOrder; sweep any
+    -- stragglers and clear the list. Windows have no Disconnect method.
     for index = #self._windowOrder, 1, -1 do
-        self._windowOrder[index]:Disconnect()
+        local window = self._windowOrder[index]
+        if table.find(self._windows, window) then
+            window:Destroy()
+        end
     end
     table.clear(self._windowOrder)
     self._focusedWindow = nil
@@ -4484,6 +6401,7 @@ function Library:Destroy()
     table.clear(self._hooked)
     table.clear(self._notifications)
     self._configAdapter = nil
+    self:_clearListeners()
     if self.Gui then self.Gui:Destroy() end
 end
 
@@ -4564,6 +6482,168 @@ function Library:BuildFromJson(json, windowOptions)
         decoded.Window = decoded.Window or windowOptions
     end
     return self:Build(decoded)
+end
+
+-- Serialisable stand-in for anything a spec cannot carry (callbacks, instances,
+-- functions). Keeps exported specs JSON-encodable without silently dropping data.
+local function exportableValue(value, depth)
+    if depth > 6 then return nil end
+    local kind = typeof(value)
+    if kind == "Color3" then
+        return string.format("#%02X%02X%02X",
+            math.floor(value.R * 255 + 0.5),
+            math.floor(value.G * 255 + 0.5),
+            math.floor(value.B * 255 + 0.5))
+    elseif kind == "EnumItem" then
+        return tostring(value)
+    elseif kind == "number" or kind == "string" or kind == "boolean" then
+        return value
+    elseif kind == "table" then
+        local result = {}
+        for key, item in pairs(value) do
+            local converted = exportableValue(item, depth + 1)
+            if converted ~= nil then
+                result[type(key) == "number" and #result + 1 or key] = converted
+            end
+        end
+        return result
+    end
+    return nil
+end
+
+local SPEC_DROP = {
+    Callback = true, Changed = true, Clear = true, Predicate = true,
+    Resolve = true, Transform = true, TransformBack = true, OnError = true,
+    Controls = true, OnClose = true, CloseRequest = true,
+}
+
+-- Window -> spec, the inverse of Build. Lets an external tool mirror the exact
+-- layout from one source of truth.
+--   local spec = Bloodshot:ExportSpec(window)
+--   local json = Bloodshot:ExportSpecJson(window)
+function Library:ExportSpec(target, options)
+    options = type(options) == "table" and options or {}
+    local window = target
+    if type(window) == "string" then
+        for _, candidate in ipairs(self._windows) do
+            if candidate._geometryKey == window then window = candidate break end
+        end
+    end
+    if type(window) ~= "table" or not window.Tabs then
+        return nil, "ExportSpec expects a window"
+    end
+    local function clean(entry, extra)
+        local result = {}
+        for key, value in pairs(entry) do
+            if not SPEC_DROP[key] and key ~= "Type" then
+                local converted = exportableValue(value, 0)
+                if converted ~= nil then result[key] = converted end
+            end
+        end
+        for key, value in pairs(extra or {}) do
+            result[key] = value
+        end
+        return result
+    end
+
+    local spec = { Window = {}, Tabs = {} }
+    local windowSpec = clean({
+        Title = window._titleLabel and window._titleLabel.Text or nil,
+        Subtitle = window._subtitleLabel and window._subtitleLabel.Text or nil,
+        Size = exportableValue(window._size, 0),
+        Position = exportableValue(window.Root.Position, 0),
+        GeometryKey = window._geometryKey,
+        Closeable = window.CloseButton ~= nil,
+        ToggleKey = comboLabel(window._toggleCombo),
+    })
+    for _, key in ipairs({
+        "SidebarSide", "SidebarWidth", "SidebarHeight", "TopbarHeight",
+        "ContentPadding", "SidebarPadding", "TabHeight", "TabWidth",
+        "TabSpacing", "SectionSpacing", "ControlSpacing", "MinimizedWidth",
+        "CornerRadius", "Resizable", "AnimatedBackground", "BackgroundParticles",
+    }) do
+        local value = window._layout[key]
+        if value ~= nil then
+            local converted = exportableValue(value, 0)
+            if converted ~= nil then windowSpec[key] = converted end
+        end
+    end
+    if window._layout.MinimumSize then
+        windowSpec.MinimumSize = {
+            window._layout.MinimumSize.X,
+            window._layout.MinimumSize.Y,
+        }
+    end
+    spec.Window = windowSpec
+
+    for _, tab in ipairs(window.Tabs) do
+        local tabSpec = {
+            Name = tab.Name,
+            Icon = tab.Icon,
+            Sections = {},
+        }
+        for _, section in ipairs(tab.Sections) do
+            local sectionSpec = {
+                Name = section.Name,
+                Collapsible = section.Collapsible == true,
+                Collapsed = section.Collapsed == true,
+                Controls = {},
+            }
+            for _, control in ipairs(section.Controls or {}) do
+                if control and control.Spec then
+                    -- Type is stripped from the copied options by clean(), so the
+                    -- control's own type is re-attached explicitly.
+                    local controlSpec = clean(control.Spec, {
+                        Type = control.Type,
+                        Name = control.Instance and control.Instance.Name or control.Spec.Name,
+                    })
+                    if options.IncludeValues ~= false and control.Flag then
+                        local ok, value = pcall(control.Get, control)
+                        local converted = ok and exportableValue(value, 0) or nil
+                        if converted ~= nil then controlSpec.Value = converted end
+                    end
+                    if control.Children then
+                        local nested = {}
+                        for _, child in ipairs(control.Children) do
+                            local childSpec = clean(child.Spec or {}, {
+                                Type = child.Type,
+                                Name = child.Instance and child.Instance.Name or child.Name,
+                            })
+                            if options.IncludeValues ~= false and child.Flag then
+                                local ok, value = pcall(child.Get, child)
+                                local converted = ok and exportableValue(value, 0) or nil
+                                if converted ~= nil then childSpec.Value = converted end
+                            end
+                            nested[#nested + 1] = childSpec
+                        end
+                        controlSpec.Controls = nested
+                    end
+                    sectionSpec.Controls[#sectionSpec.Controls + 1] = controlSpec
+                end
+            end
+            tabSpec.Sections[#tabSpec.Sections + 1] = sectionSpec
+        end
+        spec.Tabs[#spec.Tabs + 1] = tabSpec
+    end
+
+    if options.Flags ~= false then
+        spec.Flags = {}
+        for flag, value in pairs(self.Flags) do
+            local converted = exportableValue(value, 0)
+            if converted ~= nil then spec.Flags[tostring(flag)] = converted end
+        end
+    end
+    return spec
+end
+
+function Library:ExportSpecJson(target, options)
+    local spec, message = self:ExportSpec(target, options)
+    if not spec then return nil, message end
+    local ok, json = pcall(HttpService.JSONEncode, HttpService, spec)
+    if not ok then
+        return nil, "Unable to encode spec: " .. tostring(json)
+    end
+    return json
 end
 
 local THEME_COLOR_KEYS = {
