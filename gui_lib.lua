@@ -440,7 +440,7 @@ local function registerFlagSetter(window, flag, setter)
     Library:_hookFlag(flag)
 end
 
-local function makeDraggable(handle, target, bucket)
+local function makeDraggable(handle, target, bucket, window)
     local dragging = false
     local dragStart
     local startPosition
@@ -449,6 +449,11 @@ local function makeDraggable(handle, target, bucket)
     connect(handle.InputBegan, function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
             or input.UserInputType == Enum.UserInputType.Touch then
+            -- Only the topmost window at this point starts dragging, otherwise
+            -- dragging the top window would also move every window stacked below.
+            if window ~= nil and Library._isObscured ~= nil and Library:_isObscured(window, input.Position) then
+                return
+            end
             dragging = true
             dragStart = input.Position
             startPosition = target.Position
@@ -1855,33 +1860,39 @@ end
 
 -- Row children are built through a lightweight nested section, so every Add*
 -- method works unchanged; this helper just post-processes the holder it produced.
--- Controls that position their interactive parts with a fixed Y offset (slider
--- tracks, dropdown panels) cannot survive a 30px row, so each such part is
--- re-anchored to the vertical centre of the shorter row.
+-- Every direct child is vertically centred in the shorter row so names,
+-- tracks, boxes and previews share one midline instead of stacking offsets
+-- from their taller standalone holders.
 local function compactifyControl(holder, rowHeight)
     if not holder or not holder.Parent then return end
     holder.Size = UDim2.new(1, 0, 1, 0)
     holder:SetAttribute("BloodshotCompact", true)
     local nameLabel
+    local seenLabel = 0
     for _, child in ipairs(holder:GetChildren()) do
-        if not nameLabel and child:IsA("TextLabel") then
-            nameLabel = child
-        elseif child:IsA("GuiObject")
-            and child.AnchorPoint.Y == 0
-            and child.Position.Y.Scale == 0
-            and child.Size.Y.Scale == 0
-            and child.Size.Y.Offset > 0 then
-            if child.Size.Y.Offset >= rowHeight then
-                child.Size = UDim2.new(child.Size.X.Scale, child.Size.X.Offset, 0, rowHeight)
+        if child:IsA("TextLabel") then
+            seenLabel += 1
+            if seenLabel == 1 then
+                nameLabel = child
+                -- Name fills the row height and centres, keeping its designed
+                -- width so it never slides under the interactive part.
+                child.AnchorPoint = Vector2.new(child.AnchorPoint.X, 0.5)
+                child.Position = UDim2.new(child.Position.X.Scale, child.Position.X.Offset, 0.5, 0)
+                child.Size = UDim2.new(child.Size.X.Scale, child.Size.X.Offset, 1, 0)
+            else
+                -- No room for descriptions inside a single row.
+                child.Visible = false
             end
-            local centre = child.Position.Y.Offset + child.Size.Y.Offset / 2
+        elseif child:IsA("GuiObject") then
+            local height = child.Size.Y.Offset
+            if child.Size.Y.Scale ~= 0 then
+                height = rowHeight
+            elseif height <= 0 or height > rowHeight then
+                height = math.min(math.max(height, 1), rowHeight)
+            end
             child.AnchorPoint = Vector2.new(child.AnchorPoint.X, 0.5)
-            child.Position = UDim2.new(
-                child.Position.X.Scale,
-                child.Position.X.Offset,
-                0.5,
-                centre - rowHeight / 2
-            )
+            child.Position = UDim2.new(child.Position.X.Scale, child.Position.X.Offset, 0.5, 0)
+            child.Size = UDim2.new(child.Size.X.Scale, child.Size.X.Offset, 0, height)
         end
     end
     return nameLabel
@@ -3132,7 +3143,7 @@ function Section:AddColorPicker(options)
         -- own descendants and every later row draws over it, so an in-row panel
         -- ends up cut off and half hidden behind the controls below.
         Visible = false,
-        Size = UDim2.fromOffset(280, 186),
+        Size = UDim2.fromOffset(280, 176),
         BackgroundTransparency = 0,
         BorderSizePixel = 0,
         ZIndex = 60,
@@ -3165,7 +3176,9 @@ function Section:AddColorPicker(options)
     local presetArea = presetRows > 0 and presetRows * 20 + 6 or 0
     -- Presets only ever grow the panel downwards; the layout math below keys off
     -- this constant, so it has to include the swatch grid before anything is built.
-    local PANEL_HEIGHT = 186 + presetArea
+    -- Top chrome tightened (labels at 18 instead of 24) so there is no empty
+    -- band above the RGB fields.
+    local PANEL_HEIGHT = 176 + presetArea
     local function placePanel()
         if not open then return end
         local rootFrame = self.Window.Root
@@ -3199,6 +3212,27 @@ function Section:AddColorPicker(options)
     connect(self.Window.Root:GetPropertyChangedSignal("AbsoluteSize"), placePanel, self.Window._connections)
     connect(self.Window.Pages:GetPropertyChangedSignal("Visible"), function()
         if not self.Window.Pages.Visible then setOpen(false) end
+    end, self.Window._connections)
+    -- Clicking anywhere outside the panel and its preview closes the picker.
+    connect(UserInputService.InputBegan, function(input)
+        if not open then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+            and input.UserInputType ~= Enum.UserInputType.Touch then
+            return
+        end
+        local point = input.Position
+        local function inside(object)
+            if not object or not object.Visible then return false end
+            local ok, pos, size = pcall(function()
+                return object.AbsolutePosition, object.AbsoluteSize
+            end)
+            if not ok or not pos or not size then return false end
+            return point.X >= pos.X and point.Y >= pos.Y
+                and point.X <= pos.X + size.X and point.Y <= pos.Y + size.Y
+        end
+        if not inside(panel) and not inside(preview) and not inside(holder) then
+            setOpen(false)
+        end
     end, self.Window._connections)
 
     local closePicker = new("TextButton", {
@@ -3237,12 +3271,12 @@ function Section:AddColorPicker(options)
     end
     for index, channel in ipairs(labels) do
         text(panel, channel, 11, "MutedText", {
-            Position = UDim2.new((index - 1) / 3, 0, 0, 24),
+            Position = UDim2.new((index - 1) / 3, 0, 0, 18),
             Size = UDim2.new(1 / 3, -4, 0, 18),
             ZIndex = 4,
         })
         local box = new("TextBox", {
-            Position = UDim2.new((index - 1) / 3, 0, 0, 42),
+            Position = UDim2.new((index - 1) / 3, 0, 0, 36),
             Size = UDim2.new(1 / 3, -5, 0, 25),
             BackgroundColor3 = Library.Theme.SurfaceAlt,
             BorderSizePixel = 0,
@@ -3267,7 +3301,7 @@ function Section:AddColorPicker(options)
         end, self.Window._connections)
     end
     local sv = new("TextButton", {
-        Position = UDim2.fromOffset(0, 76),
+        Position = UDim2.fromOffset(0, 68),
         Size = UDim2.new(1, -42, 0, 72),
         BackgroundColor3 = Color3.fromHSV(hue, 1, 1),
         BorderSizePixel = 0,
@@ -3294,7 +3328,7 @@ function Section:AddColorPicker(options)
     })
     corner(dark, 4)
     local hueBar = new("TextButton", {
-        Position = UDim2.new(1, -32, 0, 76), Size = UDim2.fromOffset(32, 72),
+        Position = UDim2.new(1, -32, 0, 68), Size = UDim2.fromOffset(32, 72),
         BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
         Text = "", AutoButtonColor = false, ZIndex = 4, Parent = panel,
     })
@@ -3353,14 +3387,16 @@ function Section:AddColorPicker(options)
     if presetRows > 0 then
         presetHost = new("Frame", {
             Name = "Presets",
-            Position = UDim2.new(0, 0, 0, 156),
+            Position = UDim2.new(0, 0, 0, 146),
             Size = UDim2.new(1, 0, 0, presetArea),
             BackgroundTransparency = 1,
+            ClipsDescendants = true,
             Parent = panel,
         })
-        new("UIListLayout", {
+        new("UIGridLayout", {
+            CellSize = UDim2.new(1 / presetColumns, -4, 0, 17),
+            CellPadding = UDim2.new(0, 4, 0, 3),
             FillDirection = Enum.FillDirection.Horizontal,
-            Padding = UDim.new(0, 4),
             SortOrder = Enum.SortOrder.LayoutOrder,
             Parent = presetHost,
         })
@@ -3369,7 +3405,6 @@ function Section:AddColorPicker(options)
                 Name = "Preset" .. index,
                 BackgroundColor3 = preset,
                 BorderSizePixel = 0,
-                Size = UDim2.new(1 / presetColumns, -4, 0, 17),
                 AutoButtonColor = false,
                 Text = "",
                 LayoutOrder = index,
@@ -4564,36 +4599,51 @@ function Section:AddList(options)
         local label = text(frame, "", 11, "Text", {
             AnchorPoint = Vector2.new(0, 0.5),
             Position = UDim2.fromOffset(offset, 0.5),
-            Size = UDim2.new(0.45, 0, 0, rowHeight),
+            Size = UDim2.new(1, -(offset + 112), 0, rowHeight),
             TextXAlignment = Enum.TextXAlignment.Left,
         })
         local detail = text(frame, "", 10, "MutedText", {
-            AnchorPoint = Vector2.new(0, 0.5),
-            Position = UDim2.fromOffset(offset + 4, 0.5),
-            Size = UDim2.new(0.3, 0, 0, rowHeight),
-            TextXAlignment = Enum.TextXAlignment.Left,
+            AnchorPoint = Vector2.new(1, 0.5),
+            Position = UDim2.new(1, -30, 0.5, 0),
+            Size = UDim2.fromOffset(76, rowHeight),
+            TextXAlignment = Enum.TextXAlignment.Right,
         })
         local remove
+        local entry
         if options.Removable ~= false then
-            remove = text(frame, "x", 12, "MutedText", {
+            remove = new("TextButton", {
+                Name = "Remove",
                 AnchorPoint = Vector2.new(1, 0.5),
-                Position = UDim2.new(1, -8, 0.5, 0),
-                Size = UDim2.fromOffset(18, 20),
-                TextXAlignment = Enum.TextXAlignment.Center,
+                Position = UDim2.new(1, -6, 0.5, 0),
+                Size = UDim2.fromOffset(20, 20),
+                BackgroundTransparency = 1,
+                BorderSizePixel = 0,
+                AutoButtonColor = false,
+                Font = Enum.Font.GothamMedium,
+                Text = "x",
+                TextSize = 13,
+                TextColor3 = Library.Theme.MutedText,
+                ZIndex = 6,
+                Parent = frame,
             })
-            connect(remove.InputBegan, function(input)
-                if input.UserInputType == Enum.UserInputType.MouseButton1
-                    or input.UserInputType == Enum.UserInputType.Touch then
-                    if Library:_isObscured(self.Window, input.Position) then
-                        return
-                    end
-                    if not list:RemoveRow(entry.Key or entry.Label.Text) then
-                        list:Remove(entry.Data)
-                    end
+            bindTheme(remove, "TextColor3", "MutedText")
+            corner(remove, 4)
+            connect(remove.MouseEnter, function()
+                tween(remove, 0.12, { TextColor3 = Library.Theme.Error })
+            end, self.Window._connections)
+            connect(remove.MouseLeave, function()
+                tween(remove, 0.12, { TextColor3 = Library.Theme.MutedText })
+            end, self.Window._connections)
+            connect(remove.Activated, function(input)
+                if Library:_isObscured(self.Window, input and input.Position) then
+                    return
+                end
+                if not list:RemoveRow(entry.Key or entry.Label.Text) then
+                    list:Remove(entry.Data)
                 end
             end, self.Window._connections)
         end
-        local entry = {
+        entry = {
             Instance = frame,
             Label = label,
             Detail = detail,
@@ -4602,6 +4652,7 @@ function Section:AddList(options)
             Index = indexLabel,
             Remove = remove,
             Data = data,
+            Key = data.Key,
         }
         renderRow(entry, data, index)
         return entry
@@ -6418,7 +6469,34 @@ function Library:CreateWindow(options)
     -- already exists and the one you just made looks like it vanished.
     self:FocusWindow(window, false)
 
-    makeDraggable(topbar, root, connections)
+    makeDraggable(topbar, root, connections, window)
+    -- Empty edge spots also drag: thin strips along the window border that sit
+    -- behind controls (ZIndex 2 vs buttons at 4+) and cover only the padding
+    -- area, so they never overlap interactive parts. Each has the same
+    -- topmost-only guard as the topbar via makeDraggable.
+    do
+        local edgeProps = { BackgroundTransparency = 1, BorderSizePixel = 0, Active = true, ZIndex = 2 }
+        local function edge(name, anchor, position, size)
+            local strip = new("Frame", {
+                Name = name,
+                AnchorPoint = anchor,
+                Position = position,
+                Size = size,
+                BackgroundTransparency = edgeProps.BackgroundTransparency,
+                BorderSizePixel = 0,
+                Active = true,
+                ZIndex = 2,
+                Parent = root,
+            })
+            makeDraggable(strip, root, connections, window)
+            return strip
+        end
+        -- Left / right leave 24px at the bottom for the resize handle.
+        window._edgeLeft = edge("EdgeLeft", Vector2.new(0, 0), UDim2.fromOffset(0, 0), UDim2.new(0, 10, 1, -24))
+        window._edgeRight = edge("EdgeRight", Vector2.new(1, 0), UDim2.new(1, -10, 0, 0), UDim2.new(0, 10, 1, -24))
+        -- Bottom leaves room for the side strips and the resize corner.
+        window._edgeBottom = edge("EdgeBottom", Vector2.new(0, 1), UDim2.new(0, 10, 1, -10), UDim2.new(1, -34, 0, 10))
+    end
     connect(root.InputBegan, function(input)
         if input.UserInputType ~= Enum.UserInputType.MouseButton1
             and input.UserInputType ~= Enum.UserInputType.Touch then
