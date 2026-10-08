@@ -3324,6 +3324,16 @@ function Library:KeybindList(options)
         signature = nextSignature
         for _, row in ipairs(rows) do row:Destroy() end
         table.clear(rows)
+        local minWidth = tonumber(options.Width) or 170
+        local maxWidth = math.max(minWidth, tonumber(options.MaxWidth) or 300)
+        local widest = 0
+        for _, entry in ipairs(entries) do
+            entry.Caption = "[" .. entry.Key .. "]"
+            entry.KeyWidth = math.ceil(measureText(entry.Caption, 11, Enum.Font.GothamMedium, 200).X) + 4
+            local nameWidth = math.ceil(measureText(entry.Name, 11, Enum.Font.Gotham, 400).X) + 2
+            widest = math.max(widest, nameWidth + entry.KeyWidth + 12)
+        end
+        frame.Size = UDim2.fromOffset(math.clamp(widest + 20, minWidth, maxWidth), 0)
         for index, entry in ipairs(entries) do
             local row = new("Frame", {
                 LayoutOrder = index + 1,
@@ -3333,13 +3343,15 @@ function Library:KeybindList(options)
                 Parent = frame,
             })
             text(row, entry.Name, 11, entry.Active and "Text" or "MutedText", {
-                Size = UDim2.new(1, -44, 1, 0),
+                Size = UDim2.new(1, -(entry.KeyWidth + 8), 1, 0),
+                TextScaled = false,
                 ZIndex = 122,
             })
-            text(row, "[" .. entry.Key .. "]", 11, entry.Active and "Accent" or "MutedText", {
+            text(row, entry.Caption, 11, entry.Active and "Accent" or "MutedText", {
                 AnchorPoint = Vector2.new(1, 0),
                 Position = UDim2.fromScale(1, 0),
-                Size = UDim2.new(0, 44, 1, 0),
+                Size = UDim2.new(0, entry.KeyWidth, 1, 0),
+                TextScaled = false,
                 TextXAlignment = Enum.TextXAlignment.Right,
                 Font = Enum.Font.GothamMedium,
                 ZIndex = 122,
