@@ -82,9 +82,13 @@ Fonts: `Font`, `FontMedium`, `FontBold`
 - `ContextMenu` right click menu on controls
 - `QuickSearch` palette (`true` = Ctrl+K, key, or `{ Key, Ctrl, Shift, Alt }`)
 - `Commands` list of `{ Name, Description, Keywords, Callback }`
+- `AnchorPoint` (`Vector2`, `{x, y}`, or `TopLeft`, `Top`, `TopRight`, `Left`, `Center`, `Right`, `BottomLeft`, `Bottom`, `BottomRight`)
+- `TopLeft` (`Vector2` or `UDim2`) places the top-left corner whatever the anchor is
+- `KeepOnScreen` (default on) pulls the window back into view after drag, resize, viewport change and `SetGeometry`
+- `ControlDefaults` per control type option defaults, for example `{ Toggle = { StateText = true }, ["*"] = { Tooltip = "..." } }`
 
 ### Window methods
-`SetIcon`, `SetFooter`, `SetDraggable`, `SetOpacity`, `GetOpacity`, `SetBlur`, `SetToggleButton`, `SetToggleButtonVisible`, `AddTabGroup`, `ResetAll`, `SetContextMenu`, `OpenControlMenu`, `OpenSearch`, `CloseSearch`, `SetQuickSearch`, `AddCommand`, `GetCommands`, `Find`, `GetSearchEntries`, `Reveal`
+`SetIcon`, `SetFooter`, `SetDraggable`, `SetOpacity`, `GetOpacity`, `SetBlur`, `SetToggleButton`, `SetToggleButtonVisible`, `AddTabGroup`, `ResetAll`, `SetContextMenu`, `OpenControlMenu`, `OpenSearch`, `CloseSearch`, `SetQuickSearch`, `AddCommand`, `GetCommands`, `Find`, `GetSearchEntries`, `Reveal`, `SetAnchor`, `GetAnchor`, `GetTopLeft`, `SetTopLeft`, `ClampToViewport`, `SetKeepOnScreen`, `SetControlDefaults`, `SyncBindings`, `GetTabs`
 
 ### Tab and section
 - `Tab:SetName`, `Tab:SetIcon`
@@ -131,6 +135,23 @@ Fonts: `Font`, `FontMedium`, `FontBold`
 - Themes: `CreateTheme(accent)`, `RegisterThemePreset`, `SaveThemePreset`, `RemoveThemePreset`, `GetThemePresetNames`, `ExportTheme`, `ExportThemeJson`, `ImportTheme`, `SetRainbow`, `IsRainbow`
 - 7 more presets: Midnight, Emerald, Violet, Amber, Rose, Ocean, Mono
 - `CornerRadius` and `ControlTransparency` apply live to existing controls
+
+### Integration
+- Geometry: `GetGeometry` adds `AnchorPoint` and `TopLeft`; `SetGeometry` accepts `TopLeft` and converts a `Position` saved under another anchor; saved geometry reports the restored position while minimized (no drift on restore); persisted geometry stores the anchor
+- Dropdown `SetValues(values, keep)`: keeps the selection when it is still listed, `false` clears it, `{ Keep, Notify, Default }` can fire the callback and pick a fallback; returns the value count
+- Key capture: `Library:IsCapturingKey()`, `Library:WasInputCaptured(input)`, `Library:GetCapturedInput()`, events `keyCaptureStarted` and `keyCaptureEnded`
+- Config binding: control option `Bind = { Table, Key, Read, Write, OnChange }` reads the default from a plain table and writes every change back; `Library:SyncBindings(filter)`, `Window:SyncBindings()`, `control:UnbindConfig()`, `Library:UnbindConfig(table, key)`
+- Control defaults: `Library:SetControlDefaults(type, options)` (`"Toggle"`, `"AddToggle"` or `"*"`), `Library:GetControlDefaults(type)`; window defaults win over library defaults, explicit options win over both
+- Toggle `StateText` (`true` or `{ On, Off }`) shows the state beside the switch
+- `callbackError` event delivers `(message, traceback)` for every failing callback
+- Lookups: `Library:GetControl(flag)`, `Library:GetControls(filter)`, `Window:GetTabs()`, `Tab:GetSections()`, `Section:GetControls()`
+
+### Scale and lifecycle
+- Drag, resize, slider, range, picker and stepper listeners attach to the global input signals only while a press is active; dropdown and picker outside-click listeners attach only while open
+- Color picker swatches build on first open (`GetSwatches()` forces it)
+- A 132 control panel measured in the simulator: 6.2k to 3.7k instances, 4.3k to 1.8k instance connections, 369 to 11 global input listeners
+- `Library:Destroy()` leaves no connections, dialogs, captures, bindings or effects behind; 30 window create and destroy cycles show zero growth
+- Narrow row columns hide a toggle's name instead of shrinking it; `ConfigManager` and `ThemeManager` are rejected inside rows
 
 ### Misc behaviour
 - Right click control menu: reset, copy value, copy flag, custom items

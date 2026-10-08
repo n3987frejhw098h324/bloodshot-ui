@@ -128,6 +128,10 @@ local Library = {
     _history = nil,
     _historyHook = nil,
     _sounds = { Enabled = true, Volume = 0.5, Map = {}, Cache = {} },
+    _captures = {},
+    _capturedInput = nil,
+    _configBindings = {},
+    _controlDefaults = {},
     _destroyed = false,
     _animationSpeed = 1,
     _reducedMotion = false,
@@ -538,6 +542,34 @@ local function resolveColor(color, fallbackKey)
     return Library.Theme[fallbackKey or "Text"]
 end
 
+local ANCHOR_NAMES = {
+    center = Vector2.new(0.5, 0.5), topleft = Vector2.new(0, 0), top = Vector2.new(0.5, 0),
+    topright = Vector2.new(1, 0), left = Vector2.new(0, 0.5), right = Vector2.new(1, 0.5),
+    bottomleft = Vector2.new(0, 1), bottom = Vector2.new(0.5, 1), bottomright = Vector2.new(1, 1),
+}
+
+local function parseAnchor(value)
+    if typeof(value) == "Vector2" then
+        return Vector2.new(math.clamp(value.X, 0, 1), math.clamp(value.Y, 0, 1))
+    end
+    if type(value) == "string" then
+        return ANCHOR_NAMES[string.lower((string.gsub(value, "[%s_%-]", "")))]
+    end
+    if type(value) == "table" and tonumber(value[1]) and tonumber(value[2]) then
+        return Vector2.new(math.clamp(tonumber(value[1]), 0, 1), math.clamp(tonumber(value[2]), 0, 1))
+    end
+    return nil
+end
+
+local function viewportSize()
+    local camera = workspace.CurrentCamera
+    return camera and camera.ViewportSize or Vector2.zero
+end
+
+local function pixelsOf(dim, viewport)
+    return Vector2.new(viewport.X * dim.X.Scale + dim.X.Offset, viewport.Y * dim.Y.Scale + dim.Y.Offset)
+end
+
 local function measureText(content, size, font, width)
     local ok, bounds = pcall(function()
         return TextService:GetTextSize(content, size, font, Vector2.new(width, 10000))
@@ -580,9 +612,12 @@ local function safeCall(callback, ...)
     if type(callback) ~= "function" then
         return nil
     end
-    local ok, message = pcall(callback, ...)
+    local ok, message = xpcall(callback, function(err)
+        return { Message = tostring(err), Trace = debug.traceback("", 2) }
+    end, ...)
     if not ok then
-        warn("[Bloodshot UI] Callback error: " .. tostring(message))
+        warn("[Bloodshot UI] Callback error: " .. tostring(message.Message))
+        Library:_emit("callbackError", message.Message, message.Trace)
         return nil
     end
     return message
@@ -609,11 +644,67 @@ local function commitFlag(flag, value)
     Library:_notifyFlagChanged(flag)
 end
 
+local function pointerSession(bucket, onMove, onEnd)
+    local moveConnection, endConnection
+    local session = {}
+    function session.Stop()
+        if moveConnection then moveConnection:Disconnect() moveConnection = nil end
+        if endConnection then endConnection:Disconnect() endConnection = nil end
+    end
+    function session.Start()
+        session.Stop()
+        moveConnection = UserInputService.InputChanged:Connect(onMove)
+        endConnection = UserInputService.InputEnded:Connect(onEnd)
+    end
+    if bucket then table.insert(bucket, { Connected = true, Disconnect = session.Stop }) end
+    return session
+end
+
+local function outsideWatcher(bucket, callback, signalName)
+    local connection
+    local watcher = {}
+    function watcher.Attach()
+        if connection then return end
+        connection = UserInputService[signalName or "InputBegan"]:Connect(callback)
+    end
+    function watcher.Detach()
+        if connection then connection:Disconnect() connection = nil end
+    end
+    if bucket then table.insert(bucket, { Connected = true, Disconnect = watcher.Detach }) end
+    return watcher
+end
+
 local function makeDraggable(handle, target, bucket, window)
     local dragging = false
     local dragStart
     local startPosition
     local activeInput
+    local session
+    session = pointerSession(bucket, function(input)
+        if dragging and (input == activeInput
+            or input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            target.Position = UDim2.new(
+                startPosition.X.Scale,
+                startPosition.X.Offset + delta.X,
+                startPosition.Y.Scale,
+                startPosition.Y.Offset + delta.Y
+            )
+        end
+    end, function(input)
+        if input == activeInput
+            or input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            local wasDragging = dragging
+            dragging = false
+            activeInput = nil
+            session.Stop()
+            if wasDragging and window ~= nil and window._keepOnScreen and window.ClampToViewport then
+                window:ClampToViewport()
+            end
+        end
+    end)
 
     connect(handle.InputBegan, function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
@@ -630,29 +721,7 @@ local function makeDraggable(handle, target, bucket, window)
             dragStart = input.Position
             startPosition = target.Position
             activeInput = input
-        end
-    end, bucket)
-
-    connect(UserInputService.InputChanged, function(input)
-        if dragging and (input == activeInput
-            or input.UserInputType == Enum.UserInputType.MouseMovement
-            or input.UserInputType == Enum.UserInputType.Touch) then
-            local delta = input.Position - dragStart
-            target.Position = UDim2.new(
-                startPosition.X.Scale,
-                startPosition.X.Offset + delta.X,
-                startPosition.Y.Scale,
-                startPosition.Y.Offset + delta.Y
-            )
-        end
-    end, bucket)
-
-    connect(UserInputService.InputEnded, function(input)
-        if input == activeInput
-            or input.UserInputType == Enum.UserInputType.MouseButton1
-            or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
-            activeInput = nil
+            session.Start()
         end
     end, bucket)
 end
@@ -770,6 +839,36 @@ function Library:SetSounds(config)
         end
     end
     return true
+end
+
+function Library:IsCapturingKey()
+    return next(self._captures) ~= nil
+end
+
+function Library:WasInputCaptured(input)
+    return input ~= nil and self._capturedInput == input
+end
+
+function Library:GetCapturedInput()
+    return self._capturedInput
+end
+
+function Library:_captureStart(token, window)
+    if self._captures[token] then return end
+    self._captures[token] = window or true
+    self:_emit("keyCaptureStarted")
+end
+
+function Library:_captureEnd(token, input)
+    if not self._captures[token] then return end
+    self._captures[token] = nil
+    if input ~= nil then
+        self._capturedInput = input
+        task.defer(function()
+            if Library._capturedInput == input then Library._capturedInput = nil end
+        end)
+    end
+    self:_emit("keyCaptureEnded", input)
 end
 
 function Library:SetSoundsEnabled(enabled)
@@ -1085,6 +1184,23 @@ local function flagMatches(filter, flag, control)
         return false
     end
     return filter == flag
+end
+
+function Library:GetControl(flag)
+    for _, control in ipairs(self._specControls) do
+        if control.Flag == flag and control.Instance then return control end
+    end
+    return nil
+end
+
+function Library:GetControls(filter)
+    local list = {}
+    for _, control in ipairs(self._specControls) do
+        if control.Instance and (filter == nil or flagMatches(filter, control.Flag, control)) then
+            list[#list + 1] = control
+        end
+    end
+    return list
 end
 
 function Library:ResetFlags(filter, silent)
@@ -2004,6 +2120,9 @@ local function encodeGeometry(geometry)
         minimized = geometry.Minimized == true,
         visible = geometry.Visible ~= false,
     }
+    if typeof(geometry.AnchorPoint) == "Vector2" then
+        entry.anchor = { geometry.AnchorPoint.X, geometry.AnchorPoint.Y }
+    end
     if geometry.Tab then entry.tab = tostring(geometry.Tab) end
     if type(geometry.Scroll) == "table" then
         entry.scroll = {}
@@ -2044,6 +2163,9 @@ local function decodeGeometry(entry)
         Visible = entry.visible ~= false,
     }
     if entry.tab then geometry.Tab = tostring(entry.tab) end
+    if type(entry.anchor) == "table" and type(entry.anchor[1]) == "number" and type(entry.anchor[2]) == "number" then
+        geometry.AnchorPoint = Vector2.new(entry.anchor[1], entry.anchor[2])
+    end
     if type(entry.scroll) == "table" then
         geometry.Scroll = {}
         for name, pair in pairs(entry.scroll) do
@@ -2718,6 +2840,9 @@ function Library:Dialog(options)
     local keyConnection
     local cancelValue = options.CancelValue
     local stackToken = {}
+    stackToken.Cleanup = function()
+        if keyConnection then keyConnection:Disconnect() end
+    end
     self._dialogs[#self._dialogs + 1] = stackToken
     local function resolve(value)
         if resolved then return end
@@ -3621,6 +3746,7 @@ local function beginReorderDrag(handle, target, container, window, vertical, thr
     local dragging, started, startPoint = false, false, nil
     local reordered = false
     local owned = {}
+    local session
     local function isDragInput(kind)
         return kind == Enum.UserInputType.MouseButton1 or kind == Enum.UserInputType.Touch
     end
@@ -3629,6 +3755,7 @@ local function beginReorderDrag(handle, target, container, window, vertical, thr
         return connection
     end
     state.Disconnect = function()
+        if session then session.Stop() end
         for _, connection in ipairs(owned) do
             if connection.Connected then connection:Disconnect() end
         end
@@ -3639,8 +3766,9 @@ local function beginReorderDrag(handle, target, container, window, vertical, thr
         dragging, started, startPoint = true, false, input.Position
         reordered = false
         state.Dragged = false
+        session.Start()
     end, window._connections))
-    register(connect(UserInputService.InputChanged, function(input)
+    local function onMove(input)
         if not dragging then return end
         if input.UserInputType ~= Enum.UserInputType.MouseMovement
             and input.UserInputType ~= Enum.UserInputType.Touch then
@@ -3680,15 +3808,17 @@ local function beginReorderDrag(handle, target, container, window, vertical, thr
             Library._clickGuard = os.clock() + 5
             if onReorder then onReorder(best) end
         end
-    end, window._connections))
-    register(connect(UserInputService.InputEnded, function(input)
+    end
+    local function onEnd(input)
         if dragging and isDragInput(input.UserInputType) then
             if reordered then
                 Library._clickGuard = os.clock() + 0.3
             end
             dragging, started, reordered = false, false, false
+            session.Stop()
         end
-    end, window._connections))
+    end
+    session = pointerSession(window._connections, onMove, onEnd)
     return state
 end
 
@@ -3713,6 +3843,40 @@ end
 local Section = {}
 Section.__index = Section
 
+local function normalizeDefaultsKey(kind)
+    if kind == nil or kind == "*" then return "*" end
+    return controlMethodName(tostring(kind))
+end
+
+local function mergeDefaults(options, sources)
+    local copy
+    for index = 1, 4 do
+        local source = sources[index]
+        if type(source) == "table" then
+            for name, value in pairs(source) do
+                if options[name] == nil and (copy == nil or copy[name] == nil) then
+                    copy = copy or {}
+                    copy[name] = type(value) == "table" and copyTable(value) or value
+                end
+            end
+        end
+    end
+    if not copy then return options end
+    for name, value in pairs(options) do copy[name] = value end
+    return copy
+end
+
+function Library:SetControlDefaults(kind, defaults)
+    if defaults ~= nil and type(defaults) ~= "table" then return false, "Defaults must be a table" end
+    self._controlDefaults[normalizeDefaultsKey(kind)] = defaults and copyTable(defaults) or nil
+    return true
+end
+
+function Library:GetControlDefaults(kind)
+    local stored = self._controlDefaults[normalizeDefaultsKey(kind)]
+    return stored and copyTable(stored) or nil
+end
+
 -- Disabling stops existing drag handles; re-enabling applies to new controls.
 function Section:EnableReorder(enabled)
     enabled = not not enabled
@@ -3724,6 +3888,12 @@ function Section:EnableReorder(enabled)
         end
     end
     return enabled
+end
+
+function Section:GetControls()
+    local list = {}
+    for index, control in ipairs(self.Controls or {}) do list[index] = control end
+    return list
 end
 
 function Section:GetControlOrder()
@@ -3768,6 +3938,7 @@ local ROW_NAME_MIN_WIDTH = 150
 local COMPACT_MARGIN = 4
 local ROW_REJECTED = {
     AddList = true, AddRow = true, AddImage = true, AddTextArea = true, AddLog = true, AddSpacer = true,
+    AddConfigManager = true, AddThemeManager = true,
 }
 
 local function setWidth(object, scale, offset)
@@ -3824,6 +3995,20 @@ function Section:AddRow(options)
     self._overlays = self._overlays or {}
 
     local specs = type(options.Controls) == "table" and options.Controls or {}
+    local specOptions = {}
+    for name, item in pairs(options) do specOptions[name] = item end
+    specOptions.Controls = {}
+    for index, spec in ipairs(specs) do
+        if type(spec) == "table" and spec.Bind ~= nil then
+            local rest = {}
+            for name, item in pairs(spec) do
+                if name ~= "Bind" then rest[name] = item end
+            end
+            specOptions.Controls[index] = rest
+        else
+            specOptions.Controls[index] = spec
+        end
+    end
     local fixedTotal, weightTotal, childCount = 0, 0, 0
     for _, spec in ipairs(specs) do
         if type(spec) == "table" then
@@ -3919,7 +4104,17 @@ function Section:AddRow(options)
     local children = {}
     for index, spec in ipairs(specs) do
         if type(spec) == "table" then
-            local childOptions = copyTable(spec)
+            local childOptions
+            if type(spec.Bind) == "table" then
+                local rest = {}
+                for name, item in pairs(spec) do
+                    if name ~= "Bind" then rest[name] = item end
+                end
+                childOptions = copyTable(rest)
+                childOptions.Bind = spec.Bind
+            else
+                childOptions = copyTable(spec)
+            end
             childOptions.ReorderDrag = false
             local child = buildRowChild(index, childOptions, self.Window)
             if child then table.insert(children, child) end
@@ -3934,7 +4129,7 @@ function Section:AddRow(options)
         RowHeight = rowHeight,
         -- Row children carry their own specs, so a row round-trips through
         -- ExportSpec/Build as one nested control.
-        Spec = copyTable(options),
+        Spec = copyTable(specOptions),
     }
     row.Spec.Type = "AddRow"
     row.Type = "AddRow"
@@ -4055,6 +4250,12 @@ local function createKeyChip(section, parent, config)
     local value = Enum.KeyCode.Unknown
     local listening = false
     local skipActivation = false
+    local captureToken = {}
+    local function setListening(state, input)
+        if state == listening then return end
+        listening = state
+        if state then Library:_captureStart(captureToken, window) else Library:_captureEnd(captureToken, input) end
+    end
     local chip = new("TextButton", {
         AnchorPoint = Vector2.new(1, 0.5),
         Position = config.Position,
@@ -4088,7 +4289,7 @@ local function createKeyChip(section, parent, config)
         else
             return
         end
-        listening = false
+        setListening(false)
         render()
         if not silent and config.OnChanged then safeCall(config.OnChanged, value) end
     end
@@ -4105,18 +4306,20 @@ local function createKeyChip(section, parent, config)
             skipActivation = false
             return
         end
-        listening = true
+        setListening(true)
         render()
     end, window._connections)
     connect(UserInputService.InputBegan, function(input, processed)
         if listening then
             if input.UserInputType == Enum.UserInputType.Keyboard then
                 if input.KeyCode == Enum.KeyCode.Escape then
-                    listening = false
+                    setListening(false, input)
                     render()
                 elseif input.KeyCode == Enum.KeyCode.Backspace or input.KeyCode == Enum.KeyCode.Delete then
+                    setListening(false, input)
                     set(Enum.KeyCode.Unknown)
                 else
+                    setListening(false, input)
                     set(input.KeyCode)
                 end
             elseif KEY_LABELS[input.UserInputType] then
@@ -4124,6 +4327,7 @@ local function createKeyChip(section, parent, config)
                 skipActivation = input.UserInputType == Enum.UserInputType.MouseButton1
                     and input.Position.X >= topLeft.X and input.Position.X <= topLeft.X + size.X
                     and input.Position.Y >= topLeft.Y and input.Position.Y <= topLeft.Y + size.Y
+                setListening(false, input)
                 set(input.UserInputType)
             end
             return
@@ -4419,7 +4623,8 @@ function Section:AddToggle(options)
     local checkbox = string.lower(tostring(options.Style or "")) == "checkbox"
     local hasKey = not compact and options.Keybind ~= nil and options.Keybind ~= false
     local controlWidth = checkbox and 20 or 38
-    local reserve = controlWidth + 30 + (hasKey and 64 or 0)
+    local stateText = not compact and options.StateText ~= nil and options.StateText ~= false and options.StateText or nil
+    local reserve = controlWidth + 30 + (hasKey and 64 or 0) + (stateText and 38 or 0)
     local holder, nameLabel, descriptionLabel = createControlBase(self, options.Description and 52 or 40, options.Name or "Toggle", options.Description)
     nameLabel.Size = UDim2.new(1, -reserve, nameLabel.Size.Y.Scale, nameLabel.Size.Y.Offset)
     if descriptionLabel then
@@ -4467,12 +4672,29 @@ function Section:AddToggle(options)
         nameLabel.Size = UDim2.new(1, -(COMPACT_MARGIN * 2 + controlWidth + 8), 1, 0)
         track.Position = UDim2.new(1, -COMPACT_MARGIN, 0.5, 0)
     end
+    local stateLabel, onText, offText
+    if stateText then
+        local words = type(stateText) == "table" and stateText or {}
+        onText, offText = tostring(words.On or "ON"), tostring(words.Off or "OFF")
+        stateLabel = text(holder, offText, 10, "MutedText", {
+            AnchorPoint = Vector2.new(1, 0.5),
+            Position = UDim2.new(1, -(12 + controlWidth + 8 + (hasKey and 64 or 0)), 0.5, 0),
+            Size = UDim2.fromOffset(34, 18),
+            TextXAlignment = Enum.TextXAlignment.Right,
+            Font = Enum.Font.GothamMedium,
+            TextScaled = false,
+        })
+    end
 
     local value = options.Default == true
     local function accent()
         return resolveColor(options.Color, "Accent")
     end
     local function paint(animate)
+        if stateLabel then
+            stateLabel.Text = value and onText or offText
+            stateLabel.TextColor3 = value and accent() or Library.Theme.MutedText
+        end
         local fillColor
         if checkbox then
             fillColor = value and accent() or Library.Theme.Background
@@ -4517,6 +4739,16 @@ function Section:AddToggle(options)
         SetColor = function(_, color)
             options.Color = color
             paint(false)
+        end,
+        CompactLayout = function(_, showName)
+            nameLabel.Visible = showName
+            if showName then
+                track.AnchorPoint = Vector2.new(1, 0.5)
+                track.Position = UDim2.new(1, -COMPACT_MARGIN, 0.5, 0)
+            else
+                track.AnchorPoint = Vector2.new(0.5, 0.5)
+                track.Position = UDim2.new(0.5, 0, 0.5, 0)
+            end
         end,
     }
     if hasKey then
@@ -4692,23 +4924,25 @@ function Section:AddSlider(options)
         local ratio = math.clamp((input.Position.X - track.AbsolutePosition.X) / math.max(1, track.AbsoluteSize.X), 0, 1)
         set(minimum + span * ratio)
     end
+    local dragSession
+    dragSession = pointerSession(self.Window._connections, function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            updateFromInput(input)
+        end
+    end, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+            dragSession.Stop()
+        end
+    end)
     connect(hitbox.InputBegan, function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             if Library:_isObscured(self.Window, input.Position) then
                 return
             end
             dragging = true
+            dragSession.Start()
             updateFromInput(input)
-        end
-    end, self.Window._connections)
-    connect(UserInputService.InputChanged, function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-            updateFromInput(input)
-        end
-    end, self.Window._connections)
-    connect(UserInputService.InputEnded, function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
         end
     end, self.Window._connections)
     if editable then
@@ -5221,8 +5455,12 @@ function Section:AddDropdown(options)
         commitFlag(options.Flag, output)
         if not silent then safeCall(options.Callback, output) end
     end
+    local outside
     local function setOpen(nextOpen)
         open = not not nextOpen
+        if outside then
+            if open then outside.Attach() else outside.Detach() end
+        end
         local listHeight = math.min(#values, maxVisibleRows) * 28 + 8 + chrome()
         if #values == 0 then listHeight = 36 + chrome() end
         if open then
@@ -5396,7 +5634,7 @@ function Section:AddDropdown(options)
         end)
         setOpen(not open)
     end, self.Window._connections)
-    connect(UserInputService.InputBegan, function(input)
+    outside = outsideWatcher(self.Window._connections, function(input)
         if not open then return end
         if input.UserInputType ~= Enum.UserInputType.MouseButton1
             and input.UserInputType ~= Enum.UserInputType.Touch then
@@ -5412,7 +5650,7 @@ function Section:AddDropdown(options)
         if not within(holder) and not (compact and within(list)) then
             setOpen(false)
         end
-    end, self.Window._connections)
+    end)
     if compact then
         local page = self.Tab and self.Tab.Page
         if page then
@@ -5439,14 +5677,35 @@ function Section:AddDropdown(options)
         end,
         Set = function(_, nextValue, silent) set(nextValue, silent) end,
         Get = outputValue,
-        Refresh = function(_, nextValues, keepSelection)
-            if not keepSelection then selected = multi and {} or nil end
+        Refresh = function(_, nextValues, keep)
+            local notify, fallback = false, nil
+            if type(keep) == "table" then
+                notify = keep.Notify == true
+                fallback = keep.Default
+                keep = keep.Keep ~= false
+            elseif keep == nil then
+                keep = true
+            end
+            local before = stableSerialize(outputValue())
+            if not keep then
+                selected = multi and {} or nil
+                chosen = {}
+            end
             rebuild(nextValues)
             set(selected, true)
+            if fallback ~= nil then
+                local empty = true
+                if multi then empty = next(selected) == nil else empty = selected == nil end
+                if empty then set(fallback, true) end
+            end
+            if notify and stableSerialize(outputValue()) ~= before then
+                safeCall(options.Callback, outputValue())
+            end
             if open then setOpen(true) end
+            return #values
         end,
-        SetValues = function(self, nextValues, keepSelection)
-            self:Refresh(nextValues, keepSelection)
+        SetValues = function(self, nextValues, keep)
+            return self:Refresh(nextValues, keep)
         end,
         Search = function(_, query)
             if searchBox then searchBox.Text = tostring(query or "") end
@@ -5507,6 +5766,12 @@ function Section:AddKeybind(options)
     end
     local active = false
     local listening = false
+    local captureToken = {}
+    local function setListening(state, input)
+        if state == listening then return end
+        listening = state
+        if state then Library:_captureStart(captureToken, self.Window) else Library:_captureEnd(captureToken, input) end
+    end
     local ignoreNextActivation = false
     -- Declared before set()/keyName() below, which is where Default is captured.
     local mouseButtonNames = {
@@ -5563,8 +5828,8 @@ function Section:AddKeybind(options)
         end
         return mouseButtonNames[value] ~= nil and input.UserInputType == value
     end
-    local function stopListening()
-        listening = false
+    local function stopListening(input)
+        setListening(false, input)
         keyButton.Text = keyName(value)
         tween(keyButton, 0.15, { TextColor3 = Library.Theme.MutedText })
     end
@@ -5579,7 +5844,7 @@ function Section:AddKeybind(options)
             ignoreNextActivation = false
             return
         end
-        listening = true
+        setListening(true)
         keyButton.Text = captureText
         tween(keyButton, 0.15, { TextColor3 = Library.Theme.Accent })
     end, self.Window._connections)
@@ -5616,25 +5881,25 @@ function Section:AddKeybind(options)
                 -- Cancel first: without this Escape would silently become the
                 -- binding, leaving no way out of capture.
                 if cancelKey and input.KeyCode == cancelKey then
-                    stopListening()
+                    stopListening(input)
                     return
                 end
                 if table.find(clearKeys, input.KeyCode) then
-                    listening = false
+                    setListening(false, input)
                     set(Enum.KeyCode.Unknown)
                     stopListening()
                     return
                 end
-                listening = false
+                setListening(false, input)
                 set(input.KeyCode)
                 tween(keyButton, 0.15, { TextColor3 = Library.Theme.MutedText })
             elseif allowMouse and isGamepadInput(input.UserInputType)
                 and input.KeyCode ~= Enum.KeyCode.Unknown then
-                listening = false
+                setListening(false, input)
                 set(input.KeyCode)
                 tween(keyButton, 0.15, { TextColor3 = Library.Theme.MutedText })
             elseif allowMouse and mouseButtonNames[input.UserInputType] then
-                listening = false
+                setListening(false, input)
                 local point = input.Position
                 local topLeft = keyButton.AbsolutePosition
                 local bottomRight = topLeft + keyButton.AbsoluteSize
@@ -5687,12 +5952,12 @@ function Section:AddKeybind(options)
         IsListening = function() return listening end,
         IsBound = function() return value ~= Enum.KeyCode.Unknown end,
         Clear = function()
-            listening = false
+            setListening(false)
             set(Enum.KeyCode.Unknown)
             stopListening()
         end,
         StartCapture = function()
-            listening = true
+            setListening(true)
             keyButton.Text = captureText
             tween(keyButton, 0.15, { TextColor3 = Library.Theme.Accent })
         end,
@@ -5772,6 +6037,17 @@ function Section:AddColorPicker(options)
     end
     local presetColumns = math.clamp(math.floor(tonumber(options.PresetColumns) or 8), 1, 16)
     local presetSwatches = {}
+    local swatchesBuilt = false
+    local buildSwatches
+    setmetatable(presetSwatches, {
+        __index = function(_, key)
+            if not swatchesBuilt and buildSwatches then
+                buildSwatches()
+                return rawget(presetSwatches, key)
+            end
+            return nil
+        end,
+    })
     local SWATCH_SIZE = 20
     local SWATCH_GAP = 5
     local swatchRows = #presets > 0 and math.ceil(#presets / presetColumns) or 0
@@ -5813,10 +6089,17 @@ function Section:AddColorPicker(options)
         )
     end
 
+    local outside
     local function setOpen(nextOpen)
         open = not not nextOpen
         panel.Visible = open
-        if open then placePanel() end
+        if outside then
+            if open then outside.Attach() else outside.Detach() end
+        end
+        if open then
+            if buildSwatches then buildSwatches() end
+            placePanel()
+        end
     end
     -- Stay anchored to the row while the page scrolls or the window resizes.
     -- Pages is a plain Frame; the ScrollingFrame that moves is the tab's page.
@@ -5832,7 +6115,7 @@ function Section:AddColorPicker(options)
         if not self.Window.Pages.Visible then setOpen(false) end
     end, self.Window._connections)
     -- Clicking anywhere outside the panel and its preview closes the picker.
-    connect(UserInputService.InputBegan, function(input)
+    outside = outsideWatcher(self.Window._connections, function(input)
         if not open then return end
         if input.UserInputType ~= Enum.UserInputType.MouseButton1
             and input.UserInputType ~= Enum.UserInputType.Touch then
@@ -5851,7 +6134,7 @@ function Section:AddColorPicker(options)
         if not inside(panel) and not inside(preview) and not inside(holder) then
             setOpen(false)
         end
-    end, self.Window._connections)
+    end)
 
     -- Forward declaration: set() below writes the hex readout, and it is defined
     -- before the label exists.
@@ -5989,13 +6272,28 @@ function Section:AddColorPicker(options)
         set(Color3.fromHSV(hue, saturation, brightness), nil, true)
     end
     local hsvDragTarget
+    local hsvSession
+    hsvSession = pointerSession(self.Window._connections, function(input)
+        if hsvDragTarget and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            inputHSV(hsvDragTarget, input)
+        end
+    end, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            hsvDragTarget = nil
+            hsvSession.Stop()
+        end
+    end)
     connect(sv.InputBegan, function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             if Library:_isObscured(self.Window, input.Position) then
                 return
             end
             stopRainbow()
-            hsvDragTarget = sv; inputHSV(sv, input)
+            hsvDragTarget = sv
+            hsvSession.Start()
+            inputHSV(sv, input)
         end
     end, self.Window._connections)
     connect(hueBar.InputBegan, function(input)
@@ -6004,18 +6302,10 @@ function Section:AddColorPicker(options)
                 return
             end
             stopRainbow()
-            hsvDragTarget = hueBar; inputHSV(hueBar, input)
+            hsvDragTarget = hueBar
+            hsvSession.Start()
+            inputHSV(hueBar, input)
         end
-    end, self.Window._connections)
-    connect(UserInputService.InputChanged, function(input)
-        if hsvDragTarget and (input.UserInputType == Enum.UserInputType.MouseMovement
-            or input.UserInputType == Enum.UserInputType.Touch) then
-            inputHSV(hsvDragTarget, input)
-        end
-    end, self.Window._connections)
-    connect(UserInputService.InputEnded, function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-            or input.UserInputType == Enum.UserInputType.Touch then hsvDragTarget = nil end
     end, self.Window._connections)
     -- Footer row: hex readout + optional alpha on the left, Reset on the right.
     -- Anchored to the bottom edge so it always sits below the SV square
@@ -6054,33 +6344,37 @@ function Section:AddColorPicker(options)
             set(value, true, true)
         end
     end, self.Window._connections)
-    for index, preset in ipairs(presets) do
-        local column = (index - 1) % presetColumns
-        local row = math.floor((index - 1) / presetColumns)
-        local swatch = new("TextButton", {
-            Position = UDim2.fromOffset(column * (SWATCH_SIZE + SWATCH_GAP), SWATCH_TOP + row * (SWATCH_SIZE + SWATCH_GAP)),
-            Size = UDim2.fromOffset(SWATCH_SIZE, SWATCH_SIZE),
-            BackgroundColor3 = preset,
-            BorderSizePixel = 0,
-            Text = "",
-            AutoButtonColor = false,
-            ZIndex = 4,
-            Parent = panel,
-        })
-        corner(swatch, 4)
-        local swatchStroke = stroke(swatch, Color3.new(1, 1, 1), 1, 0.8)
-        connect(swatch.MouseEnter, function()
-            tween(swatchStroke, 0.12, { Transparency = 0.2 })
-        end, self.Window._connections)
-        connect(swatch.MouseLeave, function()
-            tween(swatchStroke, 0.12, { Transparency = 0.8 })
-        end, self.Window._connections)
-        connect(swatch.Activated, function(input)
-            if Library:_isObscured(self.Window, input and input.Position) then return end
-            stopRainbow()
-            set(preset)
-        end, self.Window._connections)
-        presetSwatches[index] = swatch
+    buildSwatches = function()
+        if swatchesBuilt then return end
+        swatchesBuilt = true
+        for index, preset in ipairs(presets) do
+            local column = (index - 1) % presetColumns
+            local row = math.floor((index - 1) / presetColumns)
+            local swatch = new("TextButton", {
+                Position = UDim2.fromOffset(column * (SWATCH_SIZE + SWATCH_GAP), SWATCH_TOP + row * (SWATCH_SIZE + SWATCH_GAP)),
+                Size = UDim2.fromOffset(SWATCH_SIZE, SWATCH_SIZE),
+                BackgroundColor3 = preset,
+                BorderSizePixel = 0,
+                Text = "",
+                AutoButtonColor = false,
+                ZIndex = 4,
+                Parent = panel,
+            })
+            corner(swatch, 4)
+            local swatchStroke = stroke(swatch, Color3.new(1, 1, 1), 1, 0.8)
+            connect(swatch.MouseEnter, function()
+                tween(swatchStroke, 0.12, { Transparency = 0.2 })
+            end, self.Window._connections)
+            connect(swatch.MouseLeave, function()
+                tween(swatchStroke, 0.12, { Transparency = 0.8 })
+            end, self.Window._connections)
+            connect(swatch.Activated, function(input)
+                if Library:_isObscured(self.Window, input and input.Position) then return end
+                stopRainbow()
+                set(preset)
+            end, self.Window._connections)
+            presetSwatches[index] = swatch
+        end
     end
     local alphaBox
     if options.Alpha == true then
@@ -6261,6 +6555,10 @@ function Section:AddColorPicker(options)
         GetPresets = function()
             return presets
         end,
+        GetSwatches = function()
+            if buildSwatches then buildSwatches() end
+            return presetSwatches
+        end,
     }
     -- Set here rather than in the literal above: a closure written inside a table
     -- constructor cannot see the local being constructed on this Luau build, so
@@ -6406,6 +6704,14 @@ function Section:AddNumberInput(options)
                 local function stepOnce()
                     input:Set((tonumber(input:Get()) or 0) + direction * increment)
                 end
+                local releaseWatch
+                releaseWatch = outsideWatcher(self.Window._connections, function(pointer)
+                    if pointer.UserInputType == Enum.UserInputType.MouseButton1
+                        or pointer.UserInputType == Enum.UserInputType.Touch then
+                        token += 1
+                        releaseWatch.Detach()
+                    end
+                end, "InputEnded")
                 connect(button.InputBegan, function(pointer)
                     if pointer.UserInputType ~= Enum.UserInputType.MouseButton1
                         and pointer.UserInputType ~= Enum.UserInputType.Touch then
@@ -6414,6 +6720,7 @@ function Section:AddNumberInput(options)
                     if Library:_isObscured(self.Window, pointer.Position) then return end
                     token += 1
                     local mine = token
+                    releaseWatch.Attach()
                     stepOnce()
                     task.delay(0.4, function()
                         local function repeatStep()
@@ -6424,14 +6731,9 @@ function Section:AddNumberInput(options)
                         repeatStep()
                     end)
                 end, self.Window._connections)
-                connect(UserInputService.InputEnded, function(pointer)
-                    if pointer.UserInputType == Enum.UserInputType.MouseButton1
-                        or pointer.UserInputType == Enum.UserInputType.Touch then
-                        token += 1
-                    end
-                end, self.Window._connections)
                 connect(button.MouseLeave, function()
                     token += 1
+                    releaseWatch.Detach()
                 end, self.Window._connections)
             end
             attach(stepButton("-", 0, UDim2.new(0.48, -12, 0.5, 0)), -1)
@@ -6661,6 +6963,17 @@ local function buildCompactRange(section, options, minimum, maximum, default)
         render()
         publish(false)
     end
+    local rangeSession
+    rangeSession = pointerSession(section.Window._connections, function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            drag(input)
+        end
+    end, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = nil
+            rangeSession.Stop()
+        end
+    end)
     connect(hitbox.InputBegan, function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             if Library:_isObscured(section.Window, input.Position) then
@@ -6672,17 +6985,8 @@ local function buildCompactRange(section, options, minimum, maximum, default)
             else
                 dragging = "high"
             end
+            rangeSession.Start()
             drag(input)
-        end
-    end, section.Window._connections)
-    connect(UserInputService.InputChanged, function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-            drag(input)
-        end
-    end, section.Window._connections)
-    connect(UserInputService.InputEnded, function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = nil
         end
     end, section.Window._connections)
     registerFlagSetter(section.Window, options.Flag, set)
@@ -7251,6 +7555,7 @@ local function enrichControl(control, section, options, ownedConnections, method
                 section.Window._flagSetters[flag] = nil
                 Library._flagTypes[flag] = nil
             end
+            if control._binding then Library:_removeBinding(control._binding) end
             for index = #Library._specControls, 1, -1 do
                 if Library._specControls[index] == control then
                     table.remove(Library._specControls, index)
@@ -7296,6 +7601,12 @@ end
 
 local Tab = {}
 Tab.__index = Tab
+
+function Tab:GetSections()
+    local list = {}
+    for index, section in ipairs(self.Sections) do list[index] = section end
+    return list
+end
 
 function Tab:AddSection(options)
     options = type(options) == "table" and options or { Name = tostring(options) }
@@ -9081,6 +9392,115 @@ function Section:AddThemeManager(options)
     return manager
 end
 
+local bindSeq = 0
+local bindTableIds = setmetatable({}, { __mode = "k" })
+
+local function bindFlagFor(tbl, key)
+    local id = bindTableIds[tbl]
+    if not id then
+        bindSeq += 1
+        id = bindSeq
+        bindTableIds[tbl] = id
+    end
+    return "bind." .. id .. "." .. tostring(key)
+end
+
+local function prepareBinding(options)
+    local bind = options.Bind
+    local tbl, key = bind.Table, bind.Key
+    if type(tbl) ~= "table" or key == nil then return options, nil end
+    local copy = {}
+    for name, value in pairs(options) do copy[name] = value end
+    copy.Bind = nil
+    local stored = tbl[key]
+    if copy.Default == nil and stored ~= nil then
+        local converted = stored
+        if type(bind.Read) == "function" then
+            local ok, result = pcall(bind.Read, stored)
+            converted = ok and result or nil
+        end
+        if converted ~= nil then copy.Default = converted end
+    end
+    if copy.Flag == nil then copy.Flag = bindFlagFor(tbl, key) end
+    return copy, { Table = tbl, Key = key, Read = bind.Read, Write = bind.Write, OnChange = bind.OnChange, Flag = copy.Flag }
+end
+
+local function writeBinding(binding, value, notify)
+    local out = value
+    if type(binding.Write) == "function" then
+        local ok, result = pcall(binding.Write, value)
+        if not ok then return end
+        out = result
+    end
+    binding.Table[binding.Key] = out
+    if notify and binding.OnChange then safeCall(binding.OnChange, out, value, binding.Key) end
+end
+
+local function attachBinding(control, binding)
+    if control == nil or type(control.Get) ~= "function" then return end
+    if binding.Table[binding.Key] == nil then
+        local ok, value = pcall(control.Get, control)
+        if ok and value ~= nil then writeBinding(binding, value, false) end
+    end
+    binding.Control = control
+    binding.Handle = Library:OnFlagChanged(binding.Flag, function(value)
+        writeBinding(binding, value, true)
+    end)
+    table.insert(Library._configBindings, binding)
+    control._binding = binding
+    function control:UnbindConfig()
+        Library:_removeBinding(binding)
+        return self
+    end
+end
+
+function Library:_removeBinding(binding)
+    if binding.Handle then
+        binding.Handle:Unbind()
+        binding.Handle = nil
+    end
+    local position = table.find(self._configBindings, binding)
+    if position then table.remove(self._configBindings, position) end
+    if binding.Control and binding.Control._binding == binding then binding.Control._binding = nil end
+end
+
+function Library:SyncBindings(filter)
+    local count = 0
+    for index = #self._configBindings, 1, -1 do
+        local binding = self._configBindings[index]
+        local control = binding.Control
+        if not control or not control.Instance then
+            self:_removeBinding(binding)
+        elseif flagMatches(filter, binding.Flag, control) then
+            local stored = binding.Table[binding.Key]
+            if stored ~= nil then
+                local value = stored
+                if type(binding.Read) == "function" then
+                    local ok, result = pcall(binding.Read, stored)
+                    value = ok and result or nil
+                end
+                if value ~= nil then
+                    control:Set(value, true)
+                    count += 1
+                end
+            end
+        end
+    end
+    return count
+end
+
+function Library:UnbindConfig(tbl, key)
+    local removed = 0
+    for index = #self._configBindings, 1, -1 do
+        local binding = self._configBindings[index]
+        if binding.Table == tbl and (key == nil or binding.Key == key) then
+            self:_removeBinding(binding)
+            removed += 1
+        end
+    end
+    return removed
+end
+
 -- Last of the Section:Add* definitions, so the shared v2 contract wrapper can be
 -- installed now (see the note above installControlWrappers).
 for _, methodName in ipairs({
@@ -9092,6 +9512,21 @@ for _, methodName in ipairs({
 }) do
     local original = Section[methodName]
     Section[methodName] = function(self, options)
+        if type(options) == "table" then
+            local windowDefaults = self.Window and self.Window._controlDefaults
+            if windowDefaults or next(Library._controlDefaults) then
+                options = mergeDefaults(options, {
+                    windowDefaults and windowDefaults[methodName],
+                    windowDefaults and windowDefaults["*"],
+                    Library._controlDefaults[methodName],
+                    Library._controlDefaults["*"],
+                })
+            end
+        end
+        local binding
+        if type(options) == "table" and type(options.Bind) == "table" then
+            options, binding = prepareBinding(options)
+        end
         local firstConnection = #self.Window._connections + 1
         local control = original(self, options)
         local ownedConnections = {}
@@ -9099,6 +9534,7 @@ for _, methodName in ipairs({
             table.insert(ownedConnections, self.Window._connections[index])
         end
         control = enrichControl(control, self, options, ownedConnections, methodName)
+        if control and binding then attachBinding(control, binding) end
         if control then
             -- Composite controls build their children against a partial section
             -- that only carries Container/Window; the list is created on demand so
@@ -10613,14 +11049,107 @@ function Window:SetQuickSearch(spec)
     return true
 end
 
+function Window:GetAnchor()
+    return self._anchor
+end
+
+function Window:_restoredPosition()
+    local position = self.Root.Position
+    if self.Minimized and self._minimizeOffsetY ~= 0 then
+        return UDim2.new(position.X.Scale, position.X.Offset, position.Y.Scale, position.Y.Offset + self._minimizeOffsetY)
+    end
+    return position
+end
+
+function Window:GetTopLeft()
+    if self._destroyed or not self.Root then return nil end
+    local viewport = viewportSize()
+    local position = pixelsOf(self:_restoredPosition(), viewport)
+    local size = self:_TargetSize()
+    return Vector2.new(position.X - self._anchor.X * size.X, position.Y - self._anchor.Y * size.Y)
+end
+
+function Window:SetTopLeft(topLeft)
+    if self._destroyed or not self.Root then return false end
+    local size = self:_TargetSize()
+    local position
+    if typeof(topLeft) == "Vector2" then
+        position = UDim2.fromOffset(topLeft.X + self._anchor.X * size.X, topLeft.Y + self._anchor.Y * size.Y)
+    elseif typeof(topLeft) == "UDim2" then
+        position = UDim2.new(
+            topLeft.X.Scale, topLeft.X.Offset + self._anchor.X * size.X,
+            topLeft.Y.Scale, topLeft.Y.Offset + self._anchor.Y * size.Y
+        )
+    else
+        return false
+    end
+    return self:_placeRestored(position)
+end
+
+function Window:_placeRestored(position)
+    if self.Minimized and self._minimizeOffsetY ~= 0 then
+        position = UDim2.new(position.X.Scale, position.X.Offset, position.Y.Scale, position.Y.Offset - self._minimizeOffsetY)
+    end
+    self.Root.Position = position
+    return true
+end
+
+function Window:SetAnchor(anchor)
+    if self._destroyed or not self.Root then return false end
+    local resolved = parseAnchor(anchor)
+    if not resolved then return false end
+    local previous = self._anchor
+    local size = pixelsOf(self.Root.Size, viewportSize())
+    local position = self.Root.Position
+    self.Root.AnchorPoint = resolved
+    self.Root.Position = UDim2.new(
+        position.X.Scale, position.X.Offset + (resolved.X - previous.X) * size.X,
+        position.Y.Scale, position.Y.Offset + (resolved.Y - previous.Y) * size.Y
+    )
+    self._anchor = resolved
+    if self.Minimized and self._minimizeOffsetY ~= 0 then
+        local restoredHeight = self:_TargetSize().Y
+        self._minimizeOffsetY = math.max(0, (restoredHeight - self._topbarHeight) * resolved.Y)
+    end
+    return true
+end
+
+function Window:ClampToViewport(margin)
+    if self._destroyed or not self.Root then return false end
+    local viewport = viewportSize()
+    if viewport.X <= 0 or viewport.Y <= 0 then return false end
+    margin = math.max(8, tonumber(margin) or 48)
+    local position = self.Root.Position
+    local size = pixelsOf(self.Root.Size, viewport)
+    local origin = pixelsOf(position, viewport)
+    local left = origin.X - self._anchor.X * size.X
+    local top = origin.Y - self._anchor.Y * size.Y
+    local clampedLeft = math.clamp(left, math.min(0, margin - size.X), math.max(0, viewport.X - margin))
+    local clampedTop = math.clamp(top, 0, math.max(0, viewport.Y - margin))
+    if clampedLeft == left and clampedTop == top then return false end
+    self.Root.Position = UDim2.new(
+        position.X.Scale, position.X.Offset + (clampedLeft - left),
+        position.Y.Scale, position.Y.Offset + (clampedTop - top)
+    )
+    return true
+end
+
+function Window:SetKeepOnScreen(enabled)
+    self._keepOnScreen = enabled ~= false
+    if self._keepOnScreen then self:ClampToViewport() end
+    return self._keepOnScreen
+end
+
 function Window:GetGeometry()
     if self._destroyed or not self.Root then return nil end
     local geometry = {
-        Position = self.Root.Position,
+        Position = self:_restoredPosition(),
         Size = self._size,
         Minimized = self.Minimized,
         Visible = self.Visible,
         Tab = self.ActiveTab and self.ActiveTab.Name or nil,
+        AnchorPoint = self._anchor,
+        TopLeft = self:GetTopLeft(),
     }
     for _, tab in ipairs(self.Tabs) do
         if tab.Scroll and tab.Page then
@@ -10636,8 +11165,19 @@ function Window:SetGeometry(geometry)
     if typeof(geometry.Size) == "UDim2" then
         self:SetSize(geometry.Size)
     end
-    if typeof(geometry.Position) == "UDim2" then
-        self.Root.Position = geometry.Position
+    if typeof(geometry.TopLeft) == "Vector2" or typeof(geometry.TopLeft) == "UDim2" then
+        self:SetTopLeft(geometry.TopLeft)
+    elseif typeof(geometry.Position) == "UDim2" then
+        local position = geometry.Position
+        local saved = parseAnchor(geometry.AnchorPoint)
+        if saved and (saved.X ~= self._anchor.X or saved.Y ~= self._anchor.Y) then
+            local size = self:_TargetSize()
+            position = UDim2.new(
+                position.X.Scale, position.X.Offset + (self._anchor.X - saved.X) * size.X,
+                position.Y.Scale, position.Y.Offset + (self._anchor.Y - saved.Y) * size.Y
+            )
+        end
+        self:_placeRestored(position)
     end
     if geometry.Tab then
         local tab = self._tabByName[tostring(geometry.Tab)]
@@ -10664,6 +11204,7 @@ function Window:SetGeometry(geometry)
             end
         end
     end
+    if self._keepOnScreen then self:ClampToViewport() end
     return true
 end
 
@@ -10827,7 +11368,7 @@ function Window:SetMinimized(minimized)
         -- window still playing its open tween reports a scaled size and would
         -- settle off-centre.
         local target = self:_TargetSize()
-        self._minimizeOffsetY = math.max(0, (target.Y - self._topbarHeight) * 0.5)
+        self._minimizeOffsetY = math.max(0, (target.Y - self._topbarHeight) * self._anchor.Y)
         local minimizedWidth = math.min(target.X, self._minimizedWidth)
         self._sizeConstraint.MinSize = Vector2.new(minimizedWidth, self._topbarHeight)
         local animation = tween(self.Root, 0.24, {
@@ -10845,7 +11386,7 @@ function Window:SetMinimized(minimized)
             end
         end)
     else
-        local restoreOffset = math.max(0, (self:_TargetSize().Y - self._topbarHeight) * 0.5)
+        local restoreOffset = math.max(0, (self:_TargetSize().Y - self._topbarHeight) * self._anchor.Y)
         local animation = tween(self.Root, 0.28, {
             Position = UDim2.new(
                 self.Root.Position.X.Scale,
@@ -11180,6 +11721,23 @@ end
 
 -- Per-window control statistics. ~130 controls in one window is the documented
 -- supported ceiling, so this is how a script confirms it is under it.
+function Window:SetControlDefaults(kind, defaults)
+    if defaults ~= nil and type(defaults) ~= "table" then return false, "Defaults must be a table" end
+    self._controlDefaults = self._controlDefaults or {}
+    self._controlDefaults[normalizeDefaultsKey(kind)] = defaults and copyTable(defaults) or nil
+    return true
+end
+
+function Window:GetTabs()
+    local list = {}
+    for index, tab in ipairs(self.Tabs) do list[index] = tab end
+    return list
+end
+
+function Window:SyncBindings()
+    return Library:SyncBindings(function(_, control) return control._window == self end)
+end
+
 function Window:ResetAll(filter, silent)
     local count = 0
     local snapshot = {}
@@ -11298,6 +11856,9 @@ end
 function Window:Destroy()
     if self._destroyed then return end
     if self._search then self._search.Close() end
+    for token, owner in pairs(Library._captures) do
+        if owner == self then Library._captures[token] = nil end
+    end
     self:DisableGeometryPersistence()
     self._destroyed = true
     for _, animation in ipairs(self._backgroundTweens) do
@@ -11409,10 +11970,26 @@ function Library:CreateWindow(options)
     local toggleCombo = parseComboKey(options.ToggleKey or Enum.KeyCode.Insert)
         or parseComboKey(Enum.KeyCode.Insert)
     local connections = {}
+    local anchor = parseAnchor(options.AnchorPoint or options.Anchor) or Vector2.new(0.5, 0.5)
+    local startSize = pixelsOf(size, viewportSize())
+    local startPosition = coerceUDim2(options.Position)
+    if not startPosition then
+        local topLeft = options.TopLeft
+        if typeof(topLeft) == "Vector2" then
+            startPosition = UDim2.fromOffset(topLeft.X + anchor.X * startSize.X, topLeft.Y + anchor.Y * startSize.Y)
+        elseif typeof(topLeft) == "UDim2" then
+            startPosition = UDim2.new(
+                topLeft.X.Scale, topLeft.X.Offset + anchor.X * startSize.X,
+                topLeft.Y.Scale, topLeft.Y.Offset + anchor.Y * startSize.Y
+            )
+        else
+            startPosition = UDim2.new(0.5, (anchor.X - 0.5) * startSize.X, 0.5, (anchor.Y - 0.5) * startSize.Y)
+        end
+    end
     local root = new("Frame", {
         Name = options.Title or "Bloodshot",
-        AnchorPoint = Vector2.new(0.5, 0.5),
-        Position = coerceUDim2(options.Position) or UDim2.fromScale(0.5, 0.5),
+        AnchorPoint = anchor,
+        Position = startPosition,
         Size = size,
         BackgroundTransparency = 0,
         BorderSizePixel = 0,
@@ -11802,6 +12379,8 @@ function Library:CreateWindow(options)
         _minimumSize = minimumSize,
         _minimizedWidth = minimizedWidth,
         _minimizeOffsetY = 0,
+        _anchor = anchor,
+        _keepOnScreen = options.KeepOnScreen ~= false,
         _minimizeAnimating = false,
         _topbarHeight = topbarHeight,
         _layout = {
@@ -11857,6 +12436,17 @@ function Library:CreateWindow(options)
     self:FocusWindow(window, false)
 
     makeDraggable(topbar, root, connections, window)
+    do
+        local camera = workspace.CurrentCamera
+        if camera then
+            local okSignal, viewportSignal = pcall(function() return camera:GetPropertyChangedSignal("ViewportSize") end)
+            if okSignal and viewportSignal then
+                connect(viewportSignal, function()
+                    if window._keepOnScreen and not window._destroyed then window:ClampToViewport() end
+                end, connections)
+            end
+        end
+    end
     -- Empty edge spots also drag: thin strips along the window border that sit
     -- behind controls (ZIndex 2 vs buttons at 4+) and cover only the padding
     -- area, so they never overlap interactive parts. Each has the same
@@ -11916,6 +12506,7 @@ function Library:CreateWindow(options)
         local resizeStart
         local startSize
         local startPosition
+        local resizeSession
         connect(resizeHandle.InputBegan, function(input)
             if input.UserInputType == Enum.UserInputType.MouseButton1
                 or input.UserInputType == Enum.UserInputType.Touch then
@@ -11926,18 +12517,19 @@ function Library:CreateWindow(options)
                 resizeStart = input.Position
                 startSize = root.AbsoluteSize
                 startPosition = root.Position
+                resizeSession.Start()
                 Library:FocusWindow(window)
             end
         end, connections)
-        connect(UserInputService.InputChanged, function(input)
+        resizeSession = pointerSession(connections, function(input)
             if resizing and (input.UserInputType == Enum.UserInputType.MouseMovement
                 or input.UserInputType == Enum.UserInputType.Touch) then
                 local delta = input.Position - resizeStart
-                -- Root is anchored at 0.5,0.5, so growing Size alone moves the
-                -- bottom-right corner by only half the delta. Shift Position by
-                -- half the applied growth to keep the top-left fixed, which keeps
-                -- the handle itself under the cursor. When clamped at the minimum
-                -- size the handle legitimately stops following.
+                -- Growing Size moves the bottom-right corner by only (1 - anchor)
+                -- of the delta. Shift Position by anchor * applied growth to keep
+                -- the top-left fixed, which keeps the handle itself under the
+                -- cursor. When clamped at the minimum size the handle
+                -- legitimately stops following.
                 local desiredW = startSize.X + delta.X
                 local desiredH = startSize.Y + delta.Y
                 local clampedW = math.max(window._minimumSize.X, desiredW)
@@ -11947,18 +12539,19 @@ function Library:CreateWindow(options)
                 window:SetSize(UDim2.fromOffset(clampedW, clampedH))
                 root.Position = UDim2.new(
                     startPosition.X.Scale,
-                    startPosition.X.Offset + appliedX / 2,
+                    startPosition.X.Offset + appliedX * window._anchor.X,
                     startPosition.Y.Scale,
-                    startPosition.Y.Offset + appliedY / 2
+                    startPosition.Y.Offset + appliedY * window._anchor.Y
                 )
             end
-        end, connections)
-        connect(UserInputService.InputEnded, function(input)
+        end, function(input)
             if input.UserInputType == Enum.UserInputType.MouseButton1
                 or input.UserInputType == Enum.UserInputType.Touch then
                 resizing = false
+                resizeSession.Stop()
+                if window._keepOnScreen then window:ClampToViewport() end
             end
-        end, connections)
+        end)
         window.ResizeHandle = resizeHandle
     end
     if closeButton then
@@ -12051,6 +12644,9 @@ function Library:CreateWindow(options)
         toggleButton = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
     end
     if toggleButton then window:SetToggleButton(toggleButton) end
+    if type(options.ControlDefaults) == "table" then
+        for kind, defaults in pairs(options.ControlDefaults) do window:SetControlDefaults(kind, defaults) end
+    end
     if options.ContextMenu == true then window:SetContextMenu(true) end
     if options.QuickSearch ~= nil and options.QuickSearch ~= false then window:SetQuickSearch(options.QuickSearch) end
     for _, command in ipairs(type(options.Commands) == "table" and options.Commands or {}) do
@@ -12100,7 +12696,13 @@ function Library:Destroy()
     table.clear(self._specControls)
     table.clear(self._notifications)
     table.clear(self._notificationIds)
+    for _, token in ipairs(self._dialogs) do
+        if type(token.Cleanup) == "function" then token.Cleanup() end
+    end
     table.clear(self._dialogs)
+    table.clear(self._captures)
+    table.clear(self._configBindings)
+    self._capturedInput = nil
     self._configAdapter = nil
     self:_clearListeners()
     if self.Gui then self.Gui:Destroy() end
@@ -12275,6 +12877,7 @@ local SPEC_DROP = {
     Target = true,
     ContextMenu = true,
     Adapter = true,
+    Bind = true,
 }
 
 local function menuValueText(value)
@@ -12390,7 +12993,7 @@ function Library:ExportSpec(target, options)
         Title = window._titleLabel and window._titleLabel.Text or nil,
         Subtitle = window._subtitleLabel and window._subtitleLabel.Text or nil,
         Size = exportableValue(window._size, 0),
-        Position = exportableValue(window.Root.Position, 0),
+        Position = exportableValue(window:_restoredPosition(), 0),
         GeometryKey = window._geometryKey,
         Closeable = window.CloseButton ~= nil,
         ToggleKey = comboLabel(window._toggleCombo),
@@ -12410,6 +13013,8 @@ function Library:ExportSpec(target, options)
     if window._opacity ~= 1 then windowSpec.Opacity = window._opacity end
     if window._blurSize > 0 then windowSpec.Blur = window._blurSize end
     if window._draggable == false then windowSpec.Draggable = false end
+    if window._anchor.X ~= 0.5 or window._anchor.Y ~= 0.5 then windowSpec.AnchorPoint = { window._anchor.X, window._anchor.Y } end
+    if window._keepOnScreen == false then windowSpec.KeepOnScreen = false end
     if window._contextMenuEnabled then windowSpec.ContextMenu = true end
     if window._searchSpec == true then windowSpec.QuickSearch = true end
     if window._iconSource ~= nil then windowSpec.Icon = window._iconSource end
