@@ -28,6 +28,9 @@ local window = Bloodshot:CreateWindow({
     MinimumSize = Vector2.new(520, 360),
     MinimizeButton = true,
     MinimizedWidth = 320,
+    ContextMenu = true,
+    QuickSearch = true,
+    Footer = "ctrl+k to search",
 })
 
 local mainTab = window:AddTab("stuff")
@@ -350,6 +353,166 @@ managementSection:AddButton({
             Title = "Reduced motion",
             Content = enabled and "Enabled" or "Disabled",
         })
+    end,
+})
+
+local extrasTab = window:AddTab("more stuff")
+local readoutSection = extrasTab:AddSection({
+    Name = "readouts",
+    Description = "live values",
+})
+
+local pingStat = readoutSection:AddStat({
+    Name = "ping",
+    Default = 0,
+    Suffix = " ms",
+    Color = "Success",
+    Copyable = true,
+})
+
+local loadBar = readoutSection:AddProgress({
+    Name = "loading",
+    Default = 0,
+})
+
+local consoleLog = readoutSection:AddLog({
+    Name = "console",
+    Height = 110,
+    Timestamps = true,
+})
+
+readoutSection:AddSpacer({ Height = 4 })
+
+readoutSection:AddButton({
+    Name = "fake load",
+    Description = "fills the bar",
+    Style = "Accent",
+    Cooldown = 3,
+    Callback = function()
+        loadBar:Set(0)
+        consoleLog:Info("loading started")
+        task.spawn(function()
+            for step = 1, 10 do
+                task.wait(0.15)
+                loadBar:Set(step * 10)
+                pingStat:Set(math.random(20, 90))
+            end
+            consoleLog:Success("loading done")
+        end)
+    end,
+})
+
+local inputSection = extrasTab:AddSection({
+    Name = "better inputs",
+    Collapsible = true,
+})
+
+inputSection:AddInput({
+    Name = "digits only",
+    Filter = "digits",
+    MaxLength = 6,
+    Clearable = true,
+    Placeholder = "123456",
+})
+
+inputSection:AddDropdown({
+    Name = "pick two",
+    Values = { "Red", "Green", "Blue", "Gold" },
+    Multi = true,
+    MaxSelected = 2,
+    SelectAll = true,
+})
+
+inputSection:AddTextArea({
+    Name = "notes",
+    Flag = "notes",
+    Height = 80,
+    MaxLength = 200,
+    Placeholder = "write stuff",
+})
+
+inputSection:AddToggle({
+    Name = "bound toggle",
+    Flag = "boundToggle",
+    Keybind = Enum.KeyCode.G,
+    Tag = "new",
+})
+
+inputSection:AddSlider({
+    Name = "marked slider",
+    Flag = "markedSlider",
+    Min = 0,
+    Max = 100,
+    Default = 50,
+    Editable = true,
+    Marks = { 0, 25, 50, 75, 100 },
+})
+
+local systemSection = extrasTab:AddSection("system stuff")
+
+systemSection:AddButton({
+    Name = "ask for a name",
+    Callback = function()
+        Bloodshot:Prompt({
+            Title = "name?",
+            Content = "type something",
+            Callback = function(value)
+                if value then
+                    Bloodshot:Notify({
+                        Title = "hi",
+                        Content = value,
+                    })
+                end
+            end,
+        })
+    end,
+})
+
+systemSection:AddButton({
+    Name = "undo",
+    Callback = function()
+        Bloodshot:Undo()
+    end,
+})
+
+systemSection:AddButton({
+    Name = "redo",
+    Callback = function()
+        Bloodshot:Redo()
+    end,
+})
+
+systemSection:AddButton({
+    Name = "reset every value",
+    Style = "Danger",
+    Confirm = true,
+    Callback = function()
+        window:ResetAll()
+    end,
+})
+
+local managerTab = window:AddTab("managers")
+managerTab:AddSection("configs"):AddConfigManager({
+    Folder = "bloodshot",
+    AutoSave = true,
+})
+managerTab:AddSection("theme"):AddThemeManager({
+    Flag = "theme",
+})
+
+Bloodshot:EnableHistory()
+Bloodshot:Watermark({
+    Text = "{title} | {fps} fps | {ping} ms",
+    Title = "bloodshot",
+})
+Bloodshot:KeybindList({
+    Position = "TopRight",
+})
+window:AddCommand({
+    Name = "toggle rainbow",
+    Description = "accent cycles colors",
+    Callback = function()
+        Bloodshot:SetRainbow(not Bloodshot:IsRainbow())
     end,
 })
 
