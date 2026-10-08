@@ -68,7 +68,6 @@ local Library = {
     _reducedMotion = false,
     _flagTypes = {},
     _flagListeners = {},
-    _hooked = {},
     _bindings = {},
     _dependencySubs = {},
     _controlDisposers = {},
@@ -128,17 +127,20 @@ function Library:_emit(event, ...)
     for _, entry in ipairs(snapshot) do
         if entry.Alive then
             fired += 1
-            -- Subscribe-time arguments are prepended by hand: only the final
-            -- expression in an argument list expands, so table.unpack(Args) next
-            -- to `...` would be truncated to a single nil for handlers that stored
-            -- no extra arguments.
-            local call = table.pack(...)
-            for index = entry.Args.n, 1, -1 do
-                table.insert(call, 1, entry.Args[index])
+            local emitted = table.pack(...)
+            local call = {}
+            local count = 0
+            for index = 1, entry.Args.n do
+                count += 1
+                call[count] = entry.Args[index]
+            end
+            for index = 1, emitted.n do
+                count += 1
+                call[count] = emitted[index]
             end
             -- pcall inlined rather than using safeCall: _emit is defined before
             -- safeCall exists, so a safeCall call here would resolve to a global.
-            local ok, err = pcall(entry.Callback, table.unpack(call, 1, call.n))
+            local ok, err = pcall(entry.Callback, table.unpack(call, 1, count))
             if not ok then
                 warn("[Bloodshot UI] " .. tostring(event) .. " listener error: " .. tostring(err))
             end
@@ -329,6 +331,16 @@ local function bindThemeState(object, update)
     update()
 end
 
+local function pruneThemeBindings()
+    local bindings = Library._themeBindings
+    for index = #bindings, 1, -1 do
+        local object = bindings[index].Object
+        if not object or not object.Parent then
+            table.remove(bindings, index)
+        end
+    end
+end
+
 local function gradient(parent, firstKey, secondKey, rotation)
     local effect = new("UIGradient", {
         Color = ColorSequence.new({
@@ -383,7 +395,13 @@ local function text(parent, value, size, colorKey, properties)
     if scaled then
         constrainText(label, properties.MinTextSize or math.max(7, textSize - 4), properties.MaxTextSize or textSize)
     end
-    bindTheme(label, "TextColor3", colorKey or "Text")
+    if typeof(colorKey) == "Color3" then
+        label.TextColor3 = colorKey
+    elseif Library.Theme[colorKey or "Text"] ~= nil then
+        bindTheme(label, "TextColor3", colorKey or "Text")
+    else
+        bindTheme(label, "TextColor3", "Text")
+    end
     return label
 end
 
@@ -436,8 +454,14 @@ local function registerFlagSetter(window, flag, setter)
     end
     Library._flagSetters[flag] = setter
     window._flagSetters[flag] = setter
-    -- Fan out to any listener/binding that subscribed before this control existed.
-    Library:_hookFlag(flag)
+end
+
+local function commitFlag(flag, value)
+    if flag == nil then
+        return
+    end
+    Library.Flags[flag] = value
+    Library:_notifyFlagChanged(flag)
 end
 
 local function makeDraggable(handle, target, bucket, window)
@@ -532,6 +556,7 @@ local NotificationHost = new("Frame", {
     AnchorPoint = Vector2.new(1, 1),
     Position = UDim2.new(1, -20, 1, -20),
     Size = UDim2.new(0, 330, 1, -40),
+    ZIndex = 300,
     Parent = ScreenGui,
 })
 new("UIListLayout", {
@@ -575,7 +600,10 @@ function Library:SetTheme(theme)
         local binding = self._themeBindings[index]
         if binding.Object and binding.Object.Parent then
             if binding.Update then
-                binding.Update()
+                local ok, err = pcall(binding.Update)
+                if not ok then
+                    warn("[Bloodshot UI] Theme update error: " .. tostring(err))
+                end
             elseif binding.GradientKeys then
                 binding.Object.Color = ColorSequence.new({
                     ColorSequenceKeypoint.new(0, self.Theme[binding.GradientKeys[1]]),
@@ -630,6 +658,15 @@ end
 
 function Library:SetReducedMotion(enabled)
     self._reducedMotion = not not enabled
+    for _, window in ipairs(self._windows) do
+        for _, animation in ipairs(window._backgroundTweens or {}) do
+            if self._reducedMotion then
+                animation:Pause()
+            else
+                animation:Play()
+            end
+        end
+    end
 end
 
 function Library:SetAnimationSpeed(multiplier)
@@ -642,13 +679,17 @@ function Library:SetAnimationSpeed(multiplier)
 end
 
 function Library:SetFlag(flag, value, silent)
-    self.Flags[flag] = value
+    if flag == nil then
+        return false
+    end
     local setter = self._flagSetters[flag]
     if setter then
         setter(value, silent)
     else
+        self.Flags[flag] = value
         self:_notifyFlagChanged(flag)
     end
+    return true
 end
 
 function Library:GetFlag(flag, fallback)
@@ -659,19 +700,30 @@ function Library:GetFlag(flag, fallback)
     return value
 end
 
--- Fires every listener registered for a flag. Listeners must not throw.
+-- Fires every listener registered for a flag, then every wildcard listener.
+-- Listeners receive (value, flagName). Listeners must not throw.
 function Library:_notifyFlagChanged(flag)
-    local listeners = self._flagListeners[flag]
-    if not listeners then
+    if flag == nil then
+        return
+    end
+    local key = tostring(flag)
+    local specific = self._flagListeners[key]
+    local wildcard = key ~= "*" and self._flagListeners["*"] or nil
+    if not specific and not wildcard then
         return
     end
     local snapshot = {}
-    for index, entry in ipairs(listeners) do snapshot[index] = entry end
+    for _, bucket in ipairs({ specific or {}, wildcard or {} }) do
+        for _, entry in ipairs(bucket) do
+            snapshot[#snapshot + 1] = entry
+        end
+    end
+    local value = self.Flags[flag]
     for _, entry in ipairs(snapshot) do
         if entry.Alive then
-            local ok, err = pcall(entry.Callback, self.Flags[flag])
+            local ok, err = pcall(entry.Callback, value, key)
             if not ok then
-                warn("[Bloodshot UI] Flag listener error for '" .. tostring(flag) .. "': " .. tostring(err))
+                warn("[Bloodshot UI] Flag listener error for '" .. key .. "': " .. tostring(err))
             end
         end
     end
@@ -690,10 +742,6 @@ function Library:OnFlagChanged(flag, callback)
         self._flagListeners[key] = listeners
     end
     table.insert(listeners, entry)
-    -- A control that owns the flag publishes through its own setter, so that
-    -- setter has to fan out to this listener. Without this, a listener added
-    -- after the control existed would never be called by Library:SetFlag.
-    if flag ~= nil then self:_hookFlag(key) end
     return {
         Flag = key,
         Unbind = function()
@@ -703,31 +751,6 @@ function Library:OnFlagChanged(flag, callback)
             end
         end,
     }
-end
-
--- Wraps a control's registered setter so flag writes fan out to listeners.
--- Re-wraps when a new control claims the same flag.
-function Library:_hookFlag(flag)
-    local key = tostring(flag)
-    if not self._flagListeners[key] and not self._flagListeners["*"] then
-        return nil
-    end
-    local setter = self._flagSetters[key]
-    -- Setters are plain functions; indexing a function to tag it is an error in
-    -- Luau, so wrapped originals are tracked in a side table instead.
-    if type(setter) ~= "function" then
-        return nil
-    end
-    if self._hooked[key] == setter then
-        return self._flagSetters[key]
-    end
-    local hook = function(value, silent)
-        setter(value, silent)
-        Library:_notifyFlagChanged(key)
-    end
-    self._hooked[key] = setter
-    self._flagSetters[key] = hook
-    return hook
 end
 
 -- Drives an instance property from a flag.
@@ -801,9 +824,10 @@ function Library:Bind(flag, target, property, options)
         self:SetFlag(binding.Flag, value, binding.Silent)
     end
 
-    -- OnFlagChanged hooks the flag's setter as part of subscribing, so the order
-    -- here is what matters, not the extra call.
-    table.insert(binding.Disposers, self:OnFlagChanged(flag, apply))
+    local subscription = self:OnFlagChanged(flag, apply)
+    if type(subscription) == "table" then
+        table.insert(binding.Disposers, function() subscription.Unbind() end)
+    end
     if options.Character ~= false and (binding.Resolve or options.Character) then
         local connection = LocalPlayer.CharacterAdded:Connect(function()
             task.defer(apply)
@@ -947,6 +971,7 @@ function Library:LoadConfig(json, options)
         end
         decoded = decoded.flags
     end
+    local pending = {}
     for flag, value in pairs(decoded) do
         if strict and not self._flagSetters[flag] then
             return false, "Unknown flag " .. tostring(flag)
@@ -968,9 +993,10 @@ function Library:LoadConfig(json, options)
                 return false, "Invalid EnumItem value for flag " .. tostring(flag)
             end
             local enumName, itemName = value.value:match("^Enum%.([^%.]+)%.(.+)$")
-            local enumType = enumName and Enum[enumName]
-            local enumItem = enumType and enumType[itemName]
-            if not enumItem then
+            local found, enumItem = pcall(function()
+                return Enum[enumName][itemName]
+            end)
+            if not enumName or not found or typeof(enumItem) ~= "EnumItem" then
                 return false, "Unknown EnumItem for flag " .. tostring(flag)
             end
             value = enumItem
@@ -982,7 +1008,10 @@ function Library:LoadConfig(json, options)
         if strict and expected and typeof(value) ~= expected then
             return false, "Invalid type for flag " .. tostring(flag) .. "; expected " .. expected
         end
-        self:SetFlag(flag, value, silent)
+        pending[#pending + 1] = { Flag = flag, Value = value }
+    end
+    for _, entry in ipairs(pending) do
+        self:SetFlag(entry.Flag, entry.Value, silent)
     end
     return true
 end
@@ -1030,17 +1059,20 @@ local MOUSE_BUTTON_CODES = {
     ["mouse1"] = Enum.UserInputType.MouseButton1,
     ["mouse2"] = Enum.UserInputType.MouseButton2,
     ["mouse3"] = Enum.UserInputType.MouseButton3,
+    ["mousebutton1"] = Enum.UserInputType.MouseButton1,
+    ["mousebutton2"] = Enum.UserInputType.MouseButton2,
+    ["mousebutton3"] = Enum.UserInputType.MouseButton3,
 }
 
 local function parseKeyName(raw)
     if typeof(raw) == "EnumItem" then return raw end
     if type(raw) ~= "string" or raw == "" then return nil end
-    local lower = string.lower(raw)
+    local lower = string.lower((string.gsub(raw, "^Enum%.UserInputType%.", "")))
     if MOUSE_BUTTON_CODES[lower] then return MOUSE_BUTTON_CODES[lower] end
     local named = string.gsub(raw, "^Enum%.KeyCode%.", "")
     -- Roblox throws on an unknown member rather than returning nil.
     local ok, code = pcall(function() return Enum.KeyCode[named] end)
-    if not ok or not code or code == Enum.KeyCode.Unknown then return nil end
+    if not ok or typeof(code) ~= "EnumItem" or code == Enum.KeyCode.Unknown then return nil end
     return code
 end
 
@@ -1132,7 +1164,13 @@ function Library:ImportLegacy(source, mapping)
             source = kind.Source or flag
             target = kind.Flag or flag
         end
-        local raw = applied[source] or applied[target] or legacyLookup(decoded, source)
+        local raw = applied[prefix .. tostring(source)]
+        if raw == nil then
+            raw = applied[prefix .. tostring(target)]
+        end
+        if raw == nil then
+            raw = legacyLookup(decoded, source)
+        end
         if raw == nil then
             skipped[#skipped + 1] = tostring(source)
         else
@@ -1187,15 +1225,17 @@ function Library:SaveProfile(name, options)
     if not self._configAdapter then return false, "No config adapter configured" end
     local json, message = self:SaveConfig(options)
     if not json then return false, message end
-    local ok, result = pcall(self._configAdapter.Write, self._configAdapter, tostring(name), json)
-    if not ok or result == false then return false, tostring(result) end
+    local ok, result, detail = pcall(self._configAdapter.Write, self._configAdapter, tostring(name), json)
+    if not ok then return false, tostring(result) end
+    if result == false then return false, tostring(detail or "Write failed") end
     return true
 end
 
 function Library:LoadProfile(name, options)
     if not self._configAdapter then return false, "No config adapter configured" end
     local ok, json = pcall(self._configAdapter.Read, self._configAdapter, tostring(name))
-    if not ok or type(json) ~= "string" then return false, tostring(json) end
+    if not ok then return false, tostring(json) end
+    if type(json) ~= "string" then return false, "Profile not found: " .. tostring(name) end
     return self:LoadConfig(json, options)
 end
 
@@ -1259,10 +1299,23 @@ function Library:UseFileStorage(options)
         end
         return file
     end
+    local function ensureFolder()
+        if type(folder) ~= "string" or folder == "" or type(makefolder) ~= "function" then
+            return
+        end
+        if type(isfolder) == "function" then
+            local checked, exists = pcall(isfolder, folder)
+            if checked and exists then
+                return
+            end
+        end
+        pcall(makefolder, folder)
+    end
     local adapter = {
         Name = "file",
         Path = profilePath,
         Write = function(_, name, json)
+            ensureFolder()
             local ok, err = pcall(writefile, profilePath(name), json)
             if not ok then
                 return false, tostring(err)
@@ -1299,7 +1352,7 @@ function Library:UseFileStorage(options)
             local names = {}
             for _, file in ipairs(files) do
                 local stem = string.match(tostring(file), "([^/\\]+)%.json$")
-                if stem then
+                if stem and stem ~= "__geometry" then
                     names[#names + 1] = stem
                 end
             end
@@ -1316,9 +1369,12 @@ function Library:DeleteProfile(name)
     if type(adapter.Delete) ~= "function" then
         return false, "Active adapter does not support Delete"
     end
-    local ok, result = pcall(adapter.Delete, adapter, tostring(name))
-    if not ok or result == false then
+    local ok, result, detail = pcall(adapter.Delete, adapter, tostring(name))
+    if not ok then
         return false, tostring(result)
+    end
+    if result == false then
+        return false, tostring(detail or "Delete failed")
     end
     return true
 end
@@ -1373,6 +1429,13 @@ end
 -- True when a click at `position` belongs to a window above `window` and must
 -- be ignored by `window`. Nil position falls back to the current mouse location.
 function Library:_isObscured(window, position)
+    local guard = self._clickGuard
+    if guard then
+        if os.clock() < guard then
+            return true
+        end
+        self._clickGuard = nil
+    end
     local pos = position
     if typeof(pos) ~= "Vector2" then
         local ok, mouse = pcall(function()
@@ -1421,12 +1484,15 @@ function Library:FocusWindow(target, applyTheme)
 
     local previous = self._focusedWindow
     self._focusedWindow = window
-    if previous and previous ~= window and previous._themeOverrides then
-        self:SetTheme(previous._themeRestore or DEFAULT_THEME)
+    if previous and previous ~= window and previous._themeRestore then
+        local restore = previous._themeRestore
         previous._themeRestore = nil
+        self:SetTheme(restore)
     end
     if applyTheme ~= false and window._themeOverrides then
-        window._themeRestore = copyTable(self.Theme)
+        if not window._themeRestore then
+            window._themeRestore = copyTable(self.Theme)
+        end
         self:SetTheme(window._themeOverrides)
     end
     return true
@@ -1470,8 +1536,10 @@ local function encodeGeometry(geometry)
     if type(geometry.Scroll) == "table" then
         entry.scroll = {}
         for name, offset in pairs(geometry.Scroll) do
-            if typeof(offset) == "UDim2" then
-                entry.scroll[tostring(name)] = { encodeDim(offset.X), encodeDim(offset.Y) }
+            if typeof(offset) == "Vector2" then
+                entry.scroll[tostring(name)] = { offset.X, offset.Y }
+            elseif typeof(offset) == "UDim2" then
+                entry.scroll[tostring(name)] = { offset.X.Offset, offset.Y.Offset }
             end
         end
     end
@@ -1507,8 +1575,14 @@ local function decodeGeometry(entry)
     if type(entry.scroll) == "table" then
         geometry.Scroll = {}
         for name, pair in pairs(entry.scroll) do
-            local offset = dim(pair)
-            if offset then geometry.Scroll[tostring(name)] = offset end
+            if type(pair) == "table" and type(pair[1]) == "number" and type(pair[2]) == "number" then
+                geometry.Scroll[tostring(name)] = Vector2.new(pair[1], pair[2])
+            else
+                local offset = dim(pair)
+                if offset then
+                    geometry.Scroll[tostring(name)] = Vector2.new(offset.X.Offset, offset.Y.Offset)
+                end
+            end
         end
     end
     return geometry
@@ -1526,10 +1600,19 @@ function Library:SaveGeometry()
             payload[window._geometryKey] = encodeGeometry(geometry)
         end
     end
-    local ok, result = pcall(adapter.Write, adapter, "__geometry",
-        HttpService:JSONEncode({ version = self.ConfigVersion, windows = payload }))
-    if not ok or result == false then
+    local encodedOk, json = pcall(HttpService.JSONEncode, HttpService, {
+        version = self.ConfigVersion,
+        windows = payload,
+    })
+    if not encodedOk then
+        return false, "Unable to encode geometry: " .. tostring(json)
+    end
+    local ok, result, detail = pcall(adapter.Write, adapter, "__geometry", json)
+    if not ok then
         return false, tostring(result)
+    end
+    if result == false then
+        return false, tostring(detail or "Write failed")
     end
     return true
 end
@@ -1641,6 +1724,7 @@ function Library:AutoSave(profile, options)
         Elapsed = 0,
         Dirty = false,
         Pending = false,
+        Token = 0,
         Saves = 0,
         Snapshot = self:ConfigFingerprint(),
         Connection = nil,
@@ -1657,15 +1741,17 @@ function Library:AutoSave(profile, options)
             state.Snapshot = fingerprint
             state.Dirty = true
             state.Pending = false
+            state.Token += 1
             return
         end
         if not state.Dirty or state.Pending then
             return
         end
         state.Pending = true
+        local token = state.Token
         task.delay(delay, function()
+            if self._autoSave ~= state or state.Token ~= token then return end
             state.Pending = false
-            if self._autoSave ~= state then return end
             if not state.Dirty then return end
             state.Dirty = false
             if self:SaveProfile(state.Profile, state.SaveOptions) then
@@ -1677,7 +1763,11 @@ function Library:AutoSave(profile, options)
 end
 
 function Library:Notify(options)
+    if self._destroyed then
+        return nil
+    end
     options = type(options) == "table" and options or { Content = tostring(options) }
+    pruneThemeBindings()
     for index = #self._notifications, 1, -1 do
         if not self._notifications[index].Parent then
             table.remove(self._notifications, index)
@@ -1734,7 +1824,7 @@ function Library:Notify(options)
     table.insert(self._notifications, card)
 
     tween(card, 0.3, { Size = UDim2.new(1, 0, 0, 76) })
-    tween(timer, duration, { Size = UDim2.new(0, 0, 0, 2) }, Enum.EasingStyle.Linear)
+    tween(timer, duration * math.max(0.05, Library._animationSpeed), { Size = UDim2.new(0, 0, 0, 2) }, Enum.EasingStyle.Linear)
 
     task.delay(duration, function()
         if card.Parent then
@@ -1756,7 +1846,11 @@ function Library:Notify(options)
 end
 
 function Library:Confirm(options)
-    options = options or {}
+    if self._destroyed then
+        return nil
+    end
+    options = type(options) == "table" and options or {}
+    pruneThemeBindings()
     local overlay = new("TextButton", {
         Name = "ConfirmationOverlay",
         BackgroundColor3 = self.Theme.Overlay,
@@ -1773,6 +1867,7 @@ function Library:Confirm(options)
         Position = UDim2.fromScale(0.5, 0.5),
         Size = UDim2.fromOffset(360, 170),
         BorderSizePixel = 0,
+        Active = true,
         ZIndex = 101,
         Parent = overlay,
     })
@@ -1783,7 +1878,7 @@ function Library:Confirm(options)
         Position = UDim2.fromOffset(18, 16), Size = UDim2.new(1, -36, 0, 24),
         Font = Enum.Font.GothamBold, ZIndex = 102,
     })
-    text(card, options.Content or options.Description or "Are you sure?", 12, "MutedText", {
+    text(card, options.Content or options.Description or T("AreYouSure"), 12, "MutedText", {
         Position = UDim2.fromOffset(18, 48), Size = UDim2.new(1, -36, 0, 50),
         TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top, ZIndex = 102,
     })
@@ -1925,14 +2020,31 @@ local function compactifyControl(holder, rowHeight)
     return nameLabel
 end
 
--- Renumbers a UIListLayout-backed container so the given item lands at index.
-local function reorderList(parent, item, index)
-    local children = {}
-    for _, child in ipairs(parent:GetChildren()) do
+-- LayoutOrder drives the visual order; GetChildren() keeps creation order.
+local function orderedChildren(parent)
+    local list = {}
+    local creation = {}
+    for position, child in ipairs(parent:GetChildren()) do
         if child:IsA("GuiObject") then
-            children[#children + 1] = child
+            list[#list + 1] = child
+            creation[child] = position
         end
     end
+    table.sort(list, function(a, b)
+        if a.LayoutOrder ~= b.LayoutOrder then
+            return a.LayoutOrder < b.LayoutOrder
+        end
+        if a.Name ~= b.Name then
+            return a.Name < b.Name
+        end
+        return creation[a] < creation[b]
+    end)
+    return list
+end
+
+-- Renumbers a UIListLayout-backed container so the given item lands at index.
+local function reorderList(parent, item, index)
+    local children = orderedChildren(parent)
     local from = table.find(children, item)
     if not from then return false end
     local target = math.clamp(math.floor(tonumber(index) or from), 1, #children)
@@ -1946,23 +2058,6 @@ local function reorderList(parent, item, index)
     return true
 end
 
--- LayoutOrder drives the visual order; GetChildren() keeps creation order.
-local function orderedChildren(parent)
-    local list = {}
-    for _, child in ipairs(parent:GetChildren()) do
-        if child:IsA("GuiObject") then
-            list[#list + 1] = child
-        end
-    end
-    table.sort(list, function(a, b)
-        if a.LayoutOrder == b.LayoutOrder then
-            return a.Name < b.Name
-        end
-        return a.LayoutOrder < b.LayoutOrder
-    end)
-    return list
-end
-
 -- Drag-to-reorder for anything living in a UIListLayout container.
 -- A press alone never reorders: the pointer must travel past Threshold first,
 -- so ordinary clicks, sliders and text entry are untouched.
@@ -1970,6 +2065,7 @@ local function beginReorderDrag(handle, target, container, window, vertical, thr
     if not handle or not target or not container or not window then return nil end
     local state = { Dragged = false, Disconnect = nil }
     local dragging, started, startPoint = false, false, nil
+    local reordered = false
     local owned = {}
     local function isDragInput(kind)
         return kind == Enum.UserInputType.MouseButton1 or kind == Enum.UserInputType.Touch
@@ -1987,6 +2083,8 @@ local function beginReorderDrag(handle, target, container, window, vertical, thr
     register(connect(handle.InputBegan, function(input)
         if not isDragInput(input.UserInputType) then return end
         dragging, started, startPoint = true, false, input.Position
+        reordered = false
+        state.Dragged = false
     end, window._connections))
     register(connect(UserInputService.InputChanged, function(input)
         if not dragging then return end
@@ -1997,6 +2095,9 @@ local function beginReorderDrag(handle, target, container, window, vertical, thr
         if not started then
             if (input.Position - startPoint).Magnitude < (threshold or 6) then return end
             started = true
+        end
+        if reordered then
+            Library._clickGuard = os.clock() + 5
         end
         -- Slot boundaries are the midpoints between neighbouring centres rather
         -- than the centres themselves, so the row lands under the pointer the
@@ -2021,12 +2122,17 @@ local function beginReorderDrag(handle, target, container, window, vertical, thr
         if best ~= current then
             reorderList(container, target, best)
             state.Dragged = true
+            reordered = true
+            Library._clickGuard = os.clock() + 5
             if onReorder then onReorder(best) end
         end
     end, window._connections))
     register(connect(UserInputService.InputEnded, function(input)
         if dragging and isDragInput(input.UserInputType) then
-            dragging, started = false, false
+            if reordered then
+                Library._clickGuard = os.clock() + 0.3
+            end
+            dragging, started, reordered = false, false, false
         end
     end, window._connections))
     return state
@@ -2133,18 +2239,35 @@ function Section:AddRow(options)
         Position = UDim2.fromOffset(paddingLeft, 0),
         Parent = holder,
     })
+    local rowSpacing = tonumber(options.Spacing) or 6
     new("UIListLayout", {
         FillDirection = Enum.FillDirection.Horizontal,
         SortOrder = Enum.SortOrder.LayoutOrder,
-        Padding = UDim.new(0, options.Spacing or 6),
+        Padding = UDim.new(0, rowSpacing),
         VerticalAlignment = Enum.VerticalAlignment.Center,
         Parent = strip,
     })
+    self._overlays = self._overlays or {}
+
+    local specs = type(options.Controls) == "table" and options.Controls or {}
+    local fixedTotal, weightTotal, childCount = 0, 0, 0
+    for _, spec in ipairs(specs) do
+        if type(spec) == "table" then
+            childCount += 1
+            local fixedWidth = tonumber(spec.Width)
+            if fixedWidth then
+                fixedTotal += fixedWidth
+            else
+                weightTotal += math.max(0.01, tonumber(spec.Weight) or 1)
+            end
+        end
+    end
+    local gapTotal = math.max(0, childCount - 1) * rowSpacing
 
     -- Builds a child against its own slot frame. The slot is sized to the width
     -- the caller asked for and full row height, and every control's holder is
     -- rebuilt inside it, so a compact control can never escape its column.
-    local function buildRowChild(index, childOptions, totalCount, window)
+    local function buildRowChild(index, childOptions, window)
         local childType = childOptions.Type or childOptions.type or childOptions.Control
         childOptions.Type, childOptions.type, childOptions.Control = nil, nil, nil
         local method = childType and Section[controlMethodName(tostring(childType))]
@@ -2152,13 +2275,14 @@ function Section:AddRow(options)
             warn("[Bloodshot UI] AddRow: unknown control type " .. tostring(childType))
             return nil
         end
-        local weight = tonumber(childOptions.Weight)
+        local weight = math.max(0.01, tonumber(childOptions.Weight) or 1)
         local width = tonumber(childOptions.Width)
+        local share = weight / math.max(0.01, weightTotal)
         local slot = new("Frame", {
             Name = "Slot" .. index,
             BackgroundTransparency = 1,
             Size = width and UDim2.fromOffset(width, rowHeight)
-                or UDim2.new((weight or 1) / totalCount, 0, 1, 0),
+                or UDim2.new(share, -(fixedTotal + gapTotal) * share, 1, 0),
             LayoutOrder = index,
             Parent = strip,
         })
@@ -2170,7 +2294,7 @@ function Section:AddRow(options)
             Tab = self.Tab,
             _compact = true,
             Controls = {},
-            _overlays = {},
+            _overlays = self._overlays,
             Slot = slot,
         }, { __index = Section })
         local ok, result = pcall(method, child, childOptions)
@@ -2253,13 +2377,11 @@ function Section:AddRow(options)
     end
 
     local children = {}
-    local specs = type(options.Controls) == "table" and options.Controls or {}
-    local total = math.max(1, #specs)
     for index, spec in ipairs(specs) do
         if type(spec) == "table" then
             local childOptions = copyTable(spec)
             childOptions.ReorderDrag = false
-            local child = buildRowChild(index, childOptions, total, self.Window)
+            local child = buildRowChild(index, childOptions, self.Window)
             if child then table.insert(children, child) end
         end
     end
@@ -2379,7 +2501,10 @@ function Section:AddButton(options)
         arrow.Text = "!"
         tween(holder, 0.15, { BackgroundColor3 = Library.Theme.SurfaceAlt })
         if armTimer then task.cancel(armTimer) end
-        armTimer = task.delay(options.ConfirmTimeout or 3, disarm)
+        armTimer = task.delay(options.ConfirmTimeout or 3, function()
+            armTimer = nil
+            disarm()
+        end)
     end
     connect(button.MouseEnter, function()
         if not armed then
@@ -2468,9 +2593,7 @@ function Section:AddToggle(options)
         tween(knob, 0.16, {
             Position = value and UDim2.new(1, -17, 0.5, 0) or UDim2.new(0, 3, 0.5, 0),
         })
-        if options.Flag then
-            Library.Flags[options.Flag] = value
-        end
+        commitFlag(options.Flag, value)
         if not silent then
             safeCall(options.Callback, value)
         end
@@ -2558,20 +2681,20 @@ function Section:AddSlider(options)
         return math.floor((number / increment) + 0.5) * increment
     end
     local function set(nextValue, silent)
-        value = math.clamp(round(tonumber(nextValue) or minimum), minimum, maximum)
+        local snapped = round(tonumber(nextValue) or minimum)
+        snapped = tonumber(string.format("%." .. decimals .. "f", snapped)) or snapped
+        value = math.clamp(snapped, minimum, maximum)
         local ratio = (value - minimum) / (maximum - minimum)
         fill.Size = UDim2.fromScale(ratio, 1)
         knob.Position = UDim2.fromScale(ratio, 0.5)
         valueLabel.Text = (options.Prefix or "") .. string.format("%." .. decimals .. "f", value) .. (options.Suffix or "")
-        if options.Flag then
-            Library.Flags[options.Flag] = value
-        end
+        commitFlag(options.Flag, value)
         if not silent then
             safeCall(options.Callback, value)
         end
     end
     local function updateFromInput(input)
-        local ratio = math.clamp((input.Position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+        local ratio = math.clamp((input.Position.X - track.AbsolutePosition.X) / math.max(1, track.AbsoluteSize.X), 0, 1)
         set(minimum + (maximum - minimum) * ratio)
     end
     connect(hitbox.InputBegan, function(input)
@@ -2628,20 +2751,25 @@ function Section:AddInput(options)
     padding(box, 0, 8, 0, 8)
 
     local value = box.Text
+    local normalize = type(options.Normalize) == "function" and options.Normalize or nil
+    local function validNumber(numeric)
+        return numeric ~= nil and numeric == numeric and numeric ~= math.huge and numeric ~= -math.huge
+    end
     local function set(nextValue, silent)
         if options.Numeric then
             local numeric = tonumber(nextValue)
-            if not numeric or numeric ~= numeric then
+            if not validNumber(numeric) then
                 return
+            end
+            if normalize then
+                numeric = normalize(numeric)
             end
             value = numeric
         else
             value = tostring(nextValue or "")
         end
         box.Text = tostring(value)
-        if options.Flag then
-            Library.Flags[options.Flag] = value
-        end
+        commitFlag(options.Flag, value)
         if not silent then
             safeCall(options.Callback, value)
         end
@@ -2653,18 +2781,19 @@ function Section:AddInput(options)
         tween(box, 0.15, { BackgroundColor3 = Library.Theme.Background })
         if options.Numeric then
             local numeric = tonumber(box.Text)
-            if not numeric then
-                box.Text = value
+            if not validNumber(numeric) then
+                box.Text = tostring(value)
                 return
+            end
+            if normalize then
+                numeric = normalize(numeric)
             end
             value = numeric
             box.Text = tostring(numeric)
         else
             value = box.Text
         end
-        if options.Flag then
-            Library.Flags[options.Flag] = value
-        end
+        commitFlag(options.Flag, value)
         safeCall(options.Callback, value, enterPressed)
     end, self.Window._connections)
     registerFlagSetter(self.Window, options.Flag, set)
@@ -2839,7 +2968,7 @@ function Section:AddDropdown(options)
         end
         refreshButtons()
         local output = outputValue()
-        if options.Flag then Library.Flags[options.Flag] = output end
+        commitFlag(options.Flag, output)
         if not silent then safeCall(options.Callback, output) end
     end
     local function setOpen(nextOpen)
@@ -2955,7 +3084,11 @@ function Section:AddDropdown(options)
         setOpen(not open)
     end, self.Window._connections)
     connect(UserInputService.InputBegan, function(input)
-        if not open or input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+        if not open then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+            and input.UserInputType ~= Enum.UserInputType.Touch then
+            return
+        end
         local point = input.Position
         local topLeft = holder.AbsolutePosition
         local bottomRight = topLeft + holder.AbsoluteSize
@@ -3022,15 +3155,10 @@ function Section:AddKeybind(options)
         [Enum.UserInputType.MouseButton1] = "Mouse 1",
         [Enum.UserInputType.MouseButton2] = "Mouse 2",
         [Enum.UserInputType.MouseButton3] = "Mouse 3",
-        [Enum.UserInputType.Gamepad1] = "Pad A",
-        [Enum.UserInputType.Gamepad2] = "Pad B",
-        [Enum.UserInputType.Gamepad3] = "Pad X",
-        [Enum.UserInputType.Gamepad4] = "Pad Y",
-        [Enum.UserInputType.Gamepad5] = "Pad LB",
-        [Enum.UserInputType.Gamepad6] = "Pad RB",
-        [Enum.UserInputType.Gamepad7] = "Pad LT",
-        [Enum.UserInputType.Gamepad8] = "Pad RT",
     }
+    local function isGamepadInput(kind)
+        return string.sub(kind.Name, 1, 7) == "Gamepad"
+    end
     local function isSupported(nextValue)
         return typeof(nextValue) == "EnumItem"
             and (nextValue.EnumType == Enum.KeyCode or mouseButtonNames[nextValue] ~= nil)
@@ -3062,8 +3190,19 @@ function Section:AddKeybind(options)
             value = nextValue
         end
         keyButton.Text = keyName(value)
-        if options.Flag then Library.Flags[options.Flag] = value end
+        commitFlag(options.Flag, value)
         if not silent then safeCall(options.Changed, value) end
+    end
+    local function inputMatches(input)
+        if value == nil or value == Enum.KeyCode.Unknown then
+            return false
+        end
+        if value.EnumType == Enum.KeyCode then
+            return input.KeyCode == value
+                and (input.UserInputType == Enum.UserInputType.Keyboard
+                    or isGamepadInput(input.UserInputType))
+        end
+        return mouseButtonNames[value] ~= nil and input.UserInputType == value
     end
     local function stopListening()
         listening = false
@@ -3096,14 +3235,15 @@ function Section:AddKeybind(options)
                 end
                 if table.find(clearKeys, input.KeyCode) then
                     listening = false
-                    if clearFunction then
-                        safeCall(clearFunction)
-                    else
-                        set(Enum.KeyCode.Unknown)
-                    end
+                    set(Enum.KeyCode.Unknown)
                     stopListening()
                     return
                 end
+                listening = false
+                set(input.KeyCode)
+                tween(keyButton, 0.15, { TextColor3 = Library.Theme.MutedText })
+            elseif allowMouse and isGamepadInput(input.UserInputType)
+                and input.KeyCode ~= Enum.KeyCode.Unknown then
                 listening = false
                 set(input.KeyCode)
                 tween(keyButton, 0.15, { TextColor3 = Library.Theme.MutedText })
@@ -3121,10 +3261,7 @@ function Section:AddKeybind(options)
             return
         end
         if value == Enum.KeyCode.Unknown then return end
-        local matches = value.EnumType == Enum.KeyCode
-            and input.UserInputType == Enum.UserInputType.Keyboard
-            and input.KeyCode == value
-            or (mouseButtonNames[value] ~= nil and input.UserInputType == value)
+        local matches = inputMatches(input)
         if (not processed or options.AllowProcessed == true) and matches then
             if mode == "toggle" then
                 active = not active
@@ -3140,11 +3277,7 @@ function Section:AddKeybind(options)
     connect(UserInputService.InputEnded, function(input)
         if mode ~= "hold" or not active then return end
         if value == Enum.KeyCode.Unknown then return end
-        local matches = value.EnumType == Enum.KeyCode
-            and input.UserInputType == Enum.UserInputType.Keyboard
-            and input.KeyCode == value
-            or (mouseButtonNames[value] ~= nil and input.UserInputType == value)
-        if matches then
+        if inputMatches(input) then
             active = false
             safeCall(options.Callback, false, value)
         end
@@ -3165,11 +3298,7 @@ function Section:AddKeybind(options)
         IsBound = function() return value ~= Enum.KeyCode.Unknown end,
         Clear = function()
             listening = false
-            if clearFunction then
-                safeCall(clearFunction)
-            else
-                set(Enum.KeyCode.Unknown)
-            end
+            set(Enum.KeyCode.Unknown)
             stopListening()
         end,
         StartCapture = function()
@@ -3196,11 +3325,12 @@ function Section:AddColorPicker(options)
     options = options or {}
     local holder, nameLabel = createControlBase(self, 44, options.Name or "Color")
     nameLabel.Size = UDim2.new(1, -70, 1, 0)
+    local initialColor = typeof(options.Default) == "Color3" and options.Default or Color3.new(1, 1, 1)
     local preview = new("TextButton", {
         AnchorPoint = Vector2.new(1, 0.5),
         Position = UDim2.new(1, -10, 0, 22),
         Size = UDim2.fromOffset(46, 24),
-        BackgroundColor3 = options.Default or Color3.new(1, 1, 1),
+        BackgroundColor3 = initialColor,
         BorderSizePixel = 0,
         Text = "",
         AutoButtonColor = false,
@@ -3217,6 +3347,7 @@ function Section:AddColorPicker(options)
         Size = UDim2.fromOffset(280, 176),
         BackgroundTransparency = 0,
         BorderSizePixel = 0,
+        Active = true,
         ZIndex = 60,
         Parent = self.Window.Root,
     })
@@ -3229,7 +3360,7 @@ function Section:AddColorPicker(options)
     -- computed from the raw offsets.
     local labels = { "R", "G", "B" }
     local boxes = {}
-    local value = options.Default or Color3.new(1, 1, 1)
+    local value = initialColor
     local defaultColor = value
     local alpha = math.clamp(tonumber(options.DefaultAlpha) or 1, 0, 1)
     local hue, saturation, brightness = value:ToHSV()
@@ -3316,6 +3447,7 @@ function Section:AddColorPicker(options)
     -- Forward declaration: set() below writes the hex readout, and it is defined
     -- before the label exists.
     local hexLabel
+    local svGradient
     local closePicker = new("TextButton", {
         AnchorPoint = Vector2.new(1, 0),
         Position = UDim2.new(1, 0, 0, 0),
@@ -3333,11 +3465,20 @@ function Section:AddColorPicker(options)
     constrainText(closePicker, 8, 10)
     bindTheme(closePicker, "TextColor3", "MutedText")
 
-    local function set(nextValue, silent)
+    local function set(nextValue, silent, keepHSV)
         if typeof(nextValue) ~= "Color3" then return end
         value = nextValue
-        hue, saturation, brightness = value:ToHSV()
+        if not keepHSV then
+            local h, s, v = value:ToHSV()
+            if s > 0 and v > 0 then
+                hue = h
+            end
+            saturation, brightness = s, v
+        end
         preview.BackgroundColor3 = value
+        if svGradient then
+            svGradient.Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromHSV(hue, 1, 1))
+        end
         local rgb = {
             math.floor(value.R * 255 + 0.5),
             math.floor(value.G * 255 + 0.5),
@@ -3347,7 +3488,7 @@ function Section:AddColorPicker(options)
         -- Read-only hex readout (was an editable TextBox, which duplicated the
         -- R/G/B fields and had no room in the footer).
         hexLabel.Text = string.format("#%02X%02X%02X", rgb[1], rgb[2], rgb[3])
-        if options.Flag then Library.Flags[options.Flag] = value end
+        commitFlag(options.Flag, value)
         if not silent then safeCall(options.Callback, value, alpha) end
     end
     for index, channel in ipairs(labels) do
@@ -3384,7 +3525,7 @@ function Section:AddColorPicker(options)
     local sv = new("TextButton", {
         Position = UDim2.fromOffset(0, 68),
         Size = UDim2.new(1, -42, 0, 72),
-        BackgroundColor3 = Color3.fromHSV(hue, 1, 1),
+        BackgroundColor3 = Color3.new(1, 1, 1),
         BorderSizePixel = 0,
         Text = "",
         AutoButtonColor = false,
@@ -3392,7 +3533,7 @@ function Section:AddColorPicker(options)
         Parent = panel,
     })
     corner(sv, 4)
-    new("UIGradient", {
+    svGradient = new("UIGradient", {
         Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromHSV(hue, 1, 1)),
         Transparency = NumberSequence.new(0),
         Parent = sv,
@@ -3434,8 +3575,7 @@ function Section:AddColorPicker(options)
             saturation = math.clamp(relative.X / math.max(1, target.AbsoluteSize.X), 0, 1)
             brightness = 1 - math.clamp(relative.Y / math.max(1, target.AbsoluteSize.Y), 0, 1)
         end
-        sv.BackgroundColor3 = Color3.fromHSV(hue, 1, 1)
-        set(Color3.fromHSV(hue, saturation, brightness))
+        set(Color3.fromHSV(hue, saturation, brightness), nil, true)
     end
     local hsvDragTarget
     connect(sv.InputBegan, function(input)
@@ -3493,7 +3633,7 @@ function Section:AddColorPicker(options)
         bindTheme(alphaBox, "BackgroundColor3", "SurfaceAlt")
         bindTheme(alphaBox, "TextColor3", "Text")
         connect(alphaBox.FocusLost, function()
-            alpha = math.clamp((tonumber(alphaBox.Text:gsub("%%", "")) or (alpha * 100)) / 100, 0, 1)
+            alpha = math.clamp((tonumber((string.gsub(alphaBox.Text, "%%", ""))) or (alpha * 100)) / 100, 0, 1)
             alphaBox.Text = tostring(math.floor(alpha * 100 + 0.5)) .. "%"
             safeCall(options.Callback, value, alpha)
         end, self.Window._connections)
@@ -3542,7 +3682,10 @@ function Section:AddColorPicker(options)
         Get = function() return value end,
         GetHSV = function() return hue, saturation, brightness end,
         SetHSV = function(_, h, s, v, silent)
-            set(Color3.fromHSV(math.clamp(h, 0, 1), math.clamp(s, 0, 1), math.clamp(v, 0, 1)), silent)
+            hue = math.clamp(h, 0, 1)
+            saturation = math.clamp(s, 0, 1)
+            brightness = math.clamp(v, 0, 1)
+            set(Color3.fromHSV(hue, saturation, brightness), silent, true)
         end,
         GetAlpha = function() return alpha end,
         SetAlpha = function(_, nextAlpha, silent)
@@ -3633,29 +3776,31 @@ function Section:AddNumberInput(options)
         if maximum == math.huge then number = math.min(number, 1e15) end
         return math.clamp(math.floor(number / increment + 0.5) * increment, minimumScaled, maximumScaled)
     end
+    local function snap(number)
+        local snapped = math.floor(number / increment + 0.5) * increment
+        snapped = tonumber(string.format("%.14g", snapped)) or snapped
+        return math.clamp(snapped, minimum, maximum)
+    end
     local mapped = copyTable(options)
     mapped.Numeric = true
+    mapped.Normalize = snap
     mapped.Default = normalize(options.Default) or 0
     mapped.Callback = function(raw, enterPressed)
         local number = tonumber(raw)
         if not number or number ~= number then return end
-        number = math.clamp(math.floor(number / increment + 0.5) * increment, minimum, maximum)
-        if options.Flag then Library.Flags[options.Flag] = number end
-        safeCall(callback, number, enterPressed)
+        safeCall(callback, snap(number), enterPressed)
     end
     local input = self:AddInput(mapped)
     local originalSet = input.Set
     function input:Set(value, silent)
         local number = tonumber(value)
-        if not number or number ~= number then
+        if not number or number ~= number or number == math.huge or number == -math.huge then
             -- Revert-on-invalid: anything unparseable puts the last good value
             -- back in the box instead of leaving the bad text on screen.
             originalSet(self, tostring(input:Get() or 0), true)
             return self
         end
-        number = math.clamp(math.floor(number / increment + 0.5) * increment, minimum, maximum)
-        originalSet(self, tostring(number), silent)
-        if options.Flag then Library.Flags[options.Flag] = number end
+        originalSet(self, tostring(snap(number)), silent)
         return self
     end
     local originalGet = input.Get
@@ -3664,9 +3809,6 @@ function Section:AddNumberInput(options)
     end
     local box = input.Instance and input.Instance:FindFirstChildWhichIsA("TextBox")
     if box then
-        connect(box.FocusLost, function()
-            input:Set(box.Text, true)
-        end, self.Window._connections)
         -- A number needs its affixes visible but must not have them typed into
         -- the box, so they live in their own label beside it.
         if prefix or suffix then
@@ -3727,6 +3869,7 @@ function Section:AddSegmented(options)
     local disabled = false
     local function render()
         for item, button in pairs(buttons) do
+            button.BackgroundColor3 = Library.Theme.Accent
             button.BackgroundTransparency = item == value and 0.05 or 0.72
             button.TextColor3 = item == value and Library.Theme.Text or Library.Theme.MutedText
         end
@@ -3734,7 +3877,7 @@ function Section:AddSegmented(options)
     local function set(nextValue, silent)
         if not table.find(values, nextValue) then return end
         value = nextValue
-        if options.Flag then Library.Flags[options.Flag] = value end
+        commitFlag(options.Flag, value)
         render()
         if not silent then safeCall(options.Callback, value) end
     end
@@ -3787,7 +3930,7 @@ local nested = { Container = holder, Window = self.Window, Tab = self.Tab, Contr
     local low, high
     local function publish(silent)
         local result = { low:Get(), high:Get() }
-        if options.Flag then Library.Flags[options.Flag] = result end
+        commitFlag(options.Flag, result)
         if not silent then safeCall(options.Callback, result[1], result[2], result) end
     end
     local base = {
@@ -3837,10 +3980,24 @@ end
 local function enrichControl(control, section, options, ownedConnections, methodName)
     if type(control) ~= "table" or not control.Instance then return control end
     options = type(options) == "table" and options or {}
+    if control._owned then
+        -- Composite controls (NumberInput -> Input, Radio -> Dropdown) come
+        -- through here twice for one control table: the inner pass installed
+        -- everything, so the outer pass only relabels it and takes over the
+        -- connections it created.
+        control.Type = methodName or control.Type
+        control.Spec = copyTable(options)
+        control.Spec.Type = control.Type
+        for _, connection in ipairs(ownedConnections or {}) do
+            table.insert(control._owned, connection)
+        end
+        return control
+    end
     local instance = control.Instance
     local destroyed = false
     local flag = options.Flag
     local setter = flag and section.Window._flagSetters[flag]
+    control._owned = ownedConnections or {}
     -- Remembered so ExportSpec can rebuild a spec table from a live window.
     -- AddRow children go through the same enriched Add* wrappers, so they land
     -- here like every other control.
@@ -3849,6 +4006,12 @@ local function enrichControl(control, section, options, ownedConnections, method
     control.Spec = copyTable(options or control.Spec)
     control.Spec.Type = control.Type
     table.insert(Library._specControls, control)
+    local function restingTransparency()
+        if instance:GetAttribute("BloodshotCompact") == true and instance:GetAttribute("BloodshotRow") ~= true then
+            return 1
+        end
+        return Library.Theme.ControlTransparency or 0.8
+    end
     for _, descendant in ipairs(instance:GetDescendants()) do
         if descendant:IsA("GuiButton") then
             descendant.Selectable = Library._gamepadEnabled ~= false
@@ -3856,24 +4019,17 @@ local function enrichControl(control, section, options, ownedConnections, method
                 if instance and instance.Parent then tween(instance, 0.12, { BackgroundTransparency = 0.58 }) end
             end, section.Window._connections)
             connect(descendant.SelectionLost, function()
-                if instance and instance.Parent then tween(instance, 0.12, { BackgroundTransparency = Library.Theme.ControlTransparency or 0.8 }) end
+                if instance and instance.Parent then tween(instance, 0.12, { BackgroundTransparency = restingTransparency() }) end
             end, section.Window._connections)
         end
     end
-    -- Controls write Library.Flags directly rather than through SetFlag, so a
-    -- raw registry hook cannot see control:Set(). Fan out here instead.
-    local VALUE_METHODS = { Set = true, Refresh = true, SetValues = true }
     for _, methodName in ipairs({ "Set", "Get", "Fire", "Refresh", "SetValues", "Search", "SetOpen" }) do
         local original = control[methodName]
         if type(original) == "function" then
             control[methodName] = function(self, ...)
                 if destroyed then return nil end
                 if self.Disabled and (methodName == "Fire" or methodName == "SetOpen") then return nil end
-                local result = original(self, ...)
-                if flag and VALUE_METHODS[methodName] then
-                    Library:_notifyFlagChanged(flag)
-                end
-                return result
+                return original(self, ...)
             end
         end
     end
@@ -3883,6 +4039,7 @@ local function enrichControl(control, section, options, ownedConnections, method
         local function hideTooltip()
             if tooltip then tooltip:Destroy(); tooltip = nil end
         end
+        connect(instance.Destroying, hideTooltip, section.Window._connections)
         connect(instance.MouseEnter, function()
             if destroyed or tooltip then return end
             tooltip = new("TextLabel", {
@@ -3890,7 +4047,7 @@ local function enrichControl(control, section, options, ownedConnections, method
                 BackgroundColor3 = Library.Theme.Surface,
                 BackgroundTransparency = 0.02,
                 BorderSizePixel = 0,
-                AutomaticSize = Enum.AutomaticSize.XY,
+                AutomaticSize = Enum.AutomaticSize.Y,
                 Text = tostring(options.Tooltip),
                 TextColor3 = Library.Theme.Text,
                 TextSize = 11,
@@ -3924,12 +4081,15 @@ local function enrichControl(control, section, options, ownedConnections, method
             }
             local function satisfied()
                 if type(dependency.Deps.Predicate) == "function" then
-                    -- The predicate receives the current value of the flag named
-                    -- as its first argument, so it can express arbitrary logic.
+                    -- The predicate receives a getter for flag values, so it can
+                    -- express arbitrary logic.
                     local ok, result = pcall(dependency.Deps.Predicate, function(flag)
                         return Library:GetFlag(flag, false)
                     end)
-                    return ok and result ~= false
+                    if not ok then return false end
+                    local met = not not result
+                    if dependency.Deps.Not then met = not met end
+                    return met
                 end
                 local function any(flags)
                     for _, dep in ipairs(flags) do
@@ -3985,8 +4145,17 @@ local function enrichControl(control, section, options, ownedConnections, method
                     end
                 end
             end
-            subscribe(deps)
-            subscribe(deps.Any)
+            local function subscribeAll()
+                subscribe(dependency.Deps)
+                subscribe(dependency.Deps.Any)
+                if type(dependency.Deps.Predicate) == "function" then
+                    local handle = Library:OnFlagChanged(nil, update)
+                    if type(handle) == "table" then
+                        table.insert(dependency.Handles, handle)
+                    end
+                end
+            end
+            subscribeAll()
             update()
             control.SetDependency = function(_, newDependency)
                 for _, handle in ipairs(dependency.Handles) do handle:Unbind() end
@@ -3998,8 +4167,7 @@ local function enrichControl(control, section, options, ownedConnections, method
                     dependency.Met = true
                 else
                     dependency.Deps = list
-                    subscribe(list)
-                    subscribe(list.Any)
+                    subscribeAll()
                 end
                 update()
                 return control
@@ -4108,7 +4276,7 @@ local function enrichControl(control, section, options, ownedConnections, method
             if destroyed then return end
             destroyed = true
             disposeDependency()
-            for _, connection in ipairs(ownedConnections or {}) do
+            for _, connection in ipairs(control._owned or {}) do
                 if connection.Connected then connection:Disconnect() end
             end
             if flag and Library._flagSetters[flag] == setter then
@@ -4120,6 +4288,16 @@ local function enrichControl(control, section, options, ownedConnections, method
                 if Library._specControls[index] == control then
                     table.remove(Library._specControls, index)
                 end
+            end
+            local siblings = section.Controls
+            local slot = type(siblings) == "table" and table.find(siblings, control) or nil
+            if slot then table.remove(siblings, slot) end
+            local panel = control.Panel
+            if typeof(panel) == "Instance" then
+                local overlays = section._overlays
+                local position = overlays and table.find(overlays, panel)
+                if position then table.remove(overlays, position) end
+                panel:Destroy()
             end
             if instance then instance:Destroy(); instance = nil end
             self.Instance = nil
@@ -4199,11 +4377,11 @@ function Tab:AddSection(options)
     })
     section.Collapsible = options.Collapsible == true
     connect(collapseButton.Activated, function(input)
-        if Library:_isObscured(self.Window, input and input.Position) then
-            return
-        end
         if section._dragState and section._dragState.Dragged then
             section._dragState.Dragged = false
+            return
+        end
+        if Library:_isObscured(self.Window, input and input.Position) then
             return
         end
         section:ToggleCollapsed()
@@ -4286,6 +4464,17 @@ local function filterSection(section, query)
     return visible
 end
 
+local function snapshotSearch(section)
+    if section._searchSnapshot then
+        return
+    end
+    local controls = {}
+    for _, control in ipairs(collectSearchable(section)) do
+        controls[#controls + 1] = { instance = control, visible = control.Visible }
+    end
+    section._searchSnapshot = { controls = controls }
+end
+
 -- Live search over one section's controls.
 function Section:Search(query)
     query = string.lower(tostring(query or ""))
@@ -4313,13 +4502,7 @@ function Section:Search(query)
         end
         return count
     end
-    if not self._searchSnapshot then
-        local controls = {}
-        for _, control in ipairs(collectSearchable(self)) do
-            controls[#controls + 1] = { instance = control, visible = control.Visible }
-        end
-        self._searchSnapshot = { controls = controls }
-    end
+    snapshotSearch(self)
     return filterSection(self, query)
 end
 
@@ -4383,8 +4566,7 @@ function Section:AddSearch(options)
             nameLabel.Text = options.Name or T("SearchPlaceholder")
             nameLabel.TextColor3 = Library.Theme.Text
         end
-        if not options.Flag then return end
-        Library.Flags[options.Flag] = query
+        commitFlag(options.Flag, query)
     end
     connect(box:GetPropertyChangedSignal("Text"), function()
         run(box.Text)
@@ -4538,6 +4720,8 @@ function Section:AddList(options)
     local heading
     local rowHost = new("Frame", {
         Name = "Rows",
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
         Size = UDim2.new(1, 0, 0, 0),
         AutomaticSize = Enum.AutomaticSize.Y,
         Parent = holder,
@@ -4568,9 +4752,7 @@ function Section:AddList(options)
         emptyLabel.Visible = #rows == 0
         holder:SetAttribute("BloodshotRowCount", #rows)
         holder:SetAttribute("BloodshotRowCountText", tostring(#rows))
-        if options.Flag then
-            Library.Flags[options.Flag] = #rows
-        end
+        commitFlag(options.Flag, #rows)
     end
 
     local function renderRow(entry, data, index)
@@ -4585,7 +4767,7 @@ function Section:AddList(options)
         end
         if entry.Icon then
             entry.Icon.Visible = data.Icon ~= nil
-            entry.Icon.Image = data.Icon
+            entry.Icon.Image = data.Icon and tostring(data.Icon) or ""
         end
         if entry.Remove then
             entry.Remove.Visible = options.Removable ~= false
@@ -4609,7 +4791,7 @@ function Section:AddList(options)
         corner(frame, 5)
         local accent = new("Frame", {
             AnchorPoint = Vector2.new(0, 0.5),
-            Position = UDim2.fromOffset(6, 0.5),
+            Position = UDim2.new(0, 6, 0.5, 0),
             Size = UDim2.fromOffset(4, rowHeight - 10),
             BorderSizePixel = 0,
             Visible = false,
@@ -4622,7 +4804,7 @@ function Section:AddList(options)
             icon = new("ImageLabel", {
                 BackgroundTransparency = 1,
                 AnchorPoint = Vector2.new(0, 0.5),
-                Position = UDim2.fromOffset(offset, 0.5),
+                Position = UDim2.new(0, offset, 0.5, 0),
                 Size = UDim2.fromOffset(18, 18),
                 Visible = false,
                 Parent = frame,
@@ -4686,9 +4868,7 @@ function Section:AddList(options)
                 if Library:_isObscured(self.Window, input and input.Position) then
                     return
                 end
-                if not list:RemoveRow(entry.Key or entry.Label.Text) then
-                    list:Remove(entry.Data)
-                end
+                list:RemoveRow(entry)
             end, self.Window._connections)
         end
         entry = {
@@ -4707,9 +4887,11 @@ function Section:AddList(options)
     end
 
     local function indexOf(key)
+        if key == nil then return nil end
         for position, entry in ipairs(rows) do
-            if key ~= nil and entry.Data.Key == key then return position end
-            if key == nil and entry == key then return position end
+            if entry == key or entry.Data == key or (entry.Data.Key ~= nil and entry.Data.Key == key) then
+                return position
+            end
         end
         return nil
     end
@@ -4752,16 +4934,14 @@ function Section:AddList(options)
         end,
         UpdateRow = function(self, key, data)
             if type(data) ~= "table" then return false end
-            local entry
-            for _, candidate in ipairs(rows) do
-                if candidate.Data.Key == key then entry = candidate break end
-            end
+            local position = indexOf(key)
+            local entry = position and rows[position] or nil
             if not entry then return false end
             local merged = {}
             for field, value in pairs(entry.Data) do merged[field] = value end
             for field, value in pairs(data) do merged[field] = value end
             entry.Data = merged
-            renderRow(entry, merged, indexOf(entry) or 1)
+            renderRow(entry, merged, position)
             safeCall(options.Callback, #rows, merged, "update")
             return true
         end,
@@ -4833,11 +5013,17 @@ for _, methodName in ipairs({
             -- that only carries Container/Window; the list is created on demand so
             -- those nested controls land somewhere harmless.
             if type(self.Controls) ~= "table" then self.Controls = {} end
-            table.insert(self.Controls, control)
+            if not table.find(self.Controls, control) then
+                table.insert(self.Controls, control)
+            end
+            if not control._layoutOrder then
+                self._nextOrder = (self._nextOrder or 0) + 1
+                control._layoutOrder = self._nextOrder
+            end
             -- Same reasoning as tabs/sections: without an explicit LayoutOrder
             -- the section's UIListLayout would sort controls by Name.
             if control.Instance then
-                control.Instance.LayoutOrder = #self.Controls
+                control.Instance.LayoutOrder = control._layoutOrder
             end
         end
         return control
@@ -4949,7 +5135,7 @@ function Tab:SetBadge(value)
             Name = "Badge",
             AnchorPoint = Vector2.new(1, 0.5),
             Position = UDim2.new(1, -10, 0.5, 0),
-            Size = UDim2.fromOffset(0, 0),
+            Size = UDim2.fromOffset(0, 16),
             AutomaticSize = Enum.AutomaticSize.X,
             BackgroundTransparency = 0.15,
             BorderSizePixel = 0,
@@ -4966,6 +5152,8 @@ function Tab:SetBadge(value)
         })
         local label = text(badge, "", 9, "Text", {
             Size = UDim2.fromOffset(0, 14),
+            AutomaticSize = Enum.AutomaticSize.X,
+            TextScaled = false,
             TextXAlignment = Enum.TextXAlignment.Center,
             TextSize = 9,
         })
@@ -4980,7 +5168,7 @@ function Tab:SetBadge(value)
     local base = self.Icon and ("      " .. self.Name) or ("   " .. self.Name)
     if value ~= nil then
         local width = #value
-        self.Button.Text = string.rep(" ", math.clamp(math.floor(width / 3) + 2, 3, 14)) .. base
+        self.Button.Text = base .. string.rep(" ", math.clamp(math.ceil(width * 1.6) + 2, 4, 22))
         self.Badge.BackgroundTransparency = self.Disabled and 0.75 or 0.15
     else
         self.Button.Text = base
@@ -5032,6 +5220,7 @@ function Tab:Search(query)
 
     local visibleCount = 0
     for _, section in ipairs(self.Sections) do
+        snapshotSearch(section)
         local sectionMatch = string.find(string.lower(section.Name), query, 1, true) ~= nil
         local sectionVisible = sectionMatch
         local hasSearch = false
@@ -5127,16 +5316,19 @@ function Tab:Destroy()
     if not self.Button then return end
     local window = self.Window
     for index = #self.Sections, 1, -1 do self.Sections[index]:Destroy() end
-    if window.ActiveTab == self then window.ActiveTab = nil end
-    window._tabByName[self.Name] = nil
+    local wasActive = window.ActiveTab == self
+    if wasActive then window.ActiveTab = nil end
+    if window._tabByName[self.Name] == self then window._tabByName[self.Name] = nil end
     local index = table.find(window.Tabs, self)
     if index then table.remove(window.Tabs, index) end
     self.Button:Destroy()
     self.Page:Destroy()
     self.Button = nil
     self.Page = nil
-    for _, candidate in ipairs(window.Tabs) do
-        if candidate.Button and candidate.Button.Visible then window:SelectTab(candidate); break end
+    if wasActive then
+        for _, candidate in ipairs(window.Tabs) do
+            if candidate.Button and candidate.Button.Visible then window:SelectTab(candidate); break end
+        end
     end
 end
 
@@ -5272,8 +5464,11 @@ local function parseComboKey(combo)
     if type(combo) == "string" then
         local parts = {}
         for part in string.gmatch(combo, "[^+]+") do
-            parts[#parts + 1] = normalizeModifier((string.gsub(part, "^%s*(.-)%s*$", "%1")))
+            local resolved = normalizeModifier((string.gsub(part, "^%s*(.-)%s*$", "%1")))
+            if resolved == Enum.KeyCode.Unknown then return nil end
+            parts[#parts + 1] = resolved
         end
+        if #parts == 0 then return nil end
         return { Keys = parts, Modifiers = {}, RequireAll = true, Label = combo }
     end
     if type(combo) ~= "table" then return nil end
@@ -5317,36 +5512,45 @@ local function comboLabel(combo)
 end
 
 local function comboMatches(combo, input, held)
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return false end
+    local pressed = input.KeyCode
     local matched = false
     for _, key in ipairs(combo.Keys) do
-        local hit = input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == key
-        if hit then matched = true break end
+        if pressed == key then matched = true break end
     end
     if not matched then return false end
+    -- The key being pressed counts as held even if the tracker has not seen it
+    -- yet, so a chord never depends on which InputBegan handler runs first.
+    local function isDown(key)
+        return key == pressed or held[key] == true
+    end
     if #combo.Keys > 1 and combo.RequireAll then
         for _, key in ipairs(combo.Keys) do
-            if not held[key] then return false end
+            if not isDown(key) then return false end
         end
     end
     -- Modifiers are alternatives: holding any one of them satisfies the chord.
     if #combo.Modifiers > 0 then
+        local satisfied = false
         for _, modifier in ipairs(combo.Modifiers) do
-            if held[modifier] then return true end
+            if isDown(modifier) then satisfied = true break end
         end
-        return false
+        if not satisfied then return false end
     end
     if combo.Exact then
-        for _, other in ipairs(held) do
-            local blocked = true
-            for _, key in ipairs(combo.Keys) do
-                if other == key then blocked = false break end
-            end
-            if blocked then
-                for _, modifier in ipairs(combo.Modifiers) do
-                    if other == modifier then blocked = false break end
+        for other, down in pairs(held) do
+            if down and other ~= pressed then
+                local allowed = false
+                for _, key in ipairs(combo.Keys) do
+                    if other == key then allowed = true break end
                 end
+                if not allowed then
+                    for _, modifier in ipairs(combo.Modifiers) do
+                        if other == modifier then allowed = true break end
+                    end
+                end
+                if not allowed then return false end
             end
-            if blocked then return false end
         end
     end
     return true
@@ -5466,8 +5670,13 @@ function Window:SetGeometry(geometry)
     if type(geometry.Scroll) == "table" then
         for name, offset in pairs(geometry.Scroll) do
             local tab = self._tabByName[tostring(name)]
-            if tab and tab.Page and typeof(offset) == "UDim2" then
-                tab.Page.CanvasPosition = offset
+            if tab and tab.Page then
+                if typeof(offset) == "UDim2" then
+                    offset = Vector2.new(offset.X.Offset, offset.Y.Offset)
+                end
+                if typeof(offset) == "Vector2" then
+                    tab.Page.CanvasPosition = offset
+                end
             end
         end
     end
@@ -5603,8 +5812,8 @@ function Window:_finishClose()
     end
     if onClose then
         safeCall(onClose, self)
-        Library:_emit("windowClosed", self)
     end
+    Library:_emit("windowClosed", self)
 end
 
 -- The window's intended pixel size, independent of any in-flight scale tween.
@@ -5629,6 +5838,7 @@ function Window:SetMinimized(minimized)
         self.Sidebar.Visible = false
         self.Pages.Visible = false
         self.TopbarSeparator.Visible = false
+        if self.ResizeHandle then self.ResizeHandle.Visible = false end
         -- Target size resolved from the viewport, not the live AbsoluteSize: a
         -- window still playing its open tween reports a scaled size and would
         -- settle off-centre.
@@ -5667,6 +5877,7 @@ function Window:SetMinimized(minimized)
                 self.Sidebar.Visible = true
                 self.Pages.Visible = true
                 self.TopbarSeparator.Visible = true
+                if self.ResizeHandle then self.ResizeHandle.Visible = true end
             end
             if not self._destroyed then
                 self._minimizeAnimating = false
@@ -5859,9 +6070,10 @@ end
 
 function Window:SetTheme(overrides)
     if overrides == nil then
+        local restore = self._themeRestore
         self._themeOverrides = nil
         self._themeRestore = nil
-        if Library._focusedWindow == self then Library:SetTheme(DEFAULT_THEME) end
+        if restore and Library._focusedWindow == self then Library:SetTheme(restore) end
         return true
     end
     if type(overrides) ~= "table" then
@@ -5869,7 +6081,9 @@ function Window:SetTheme(overrides)
     end
     self._themeOverrides = copyTable(overrides)
     if Library._focusedWindow == self then
-        self._themeRestore = copyTable(Library.Theme)
+        if not self._themeRestore then
+            self._themeRestore = copyTable(Library.Theme)
+        end
         Library:SetTheme(self._themeOverrides)
     end
     return true
@@ -5980,7 +6194,13 @@ function Window:FocusStep(direction)
     local current = GuiService.SelectedObject
     local index = 0
     if current then index = table.find(list, current) or 0 end
-    local target = ((index - 1 + (direction or 1)) % #list) + 1
+    local step = direction or 1
+    local target
+    if index == 0 then
+        target = step < 0 and #list or 1
+    else
+        target = ((index - 1 + step) % #list) + 1
+    end
     local object = list[target]
     GuiService.SelectedObject = object
     return object
@@ -6011,6 +6231,7 @@ end
 
 function Window:Destroy()
     if self._destroyed then return end
+    self:DisableGeometryPersistence()
     self._destroyed = true
     for _, animation in ipairs(self._backgroundTweens) do
         animation:Cancel()
@@ -6023,6 +6244,7 @@ function Window:Destroy()
     for flag, setter in pairs(self._flagSetters) do
         if Library._flagSetters[flag] == setter then
             Library._flagSetters[flag] = nil
+            Library._flagTypes[flag] = nil
         end
     end
     table.clear(self._flagSetters)
@@ -6041,14 +6263,44 @@ function Window:Destroy()
             table.remove(Library._windowOrder, index)
         end
     end
-    if Library._focusedWindow == self then
+    local wasFocused = Library._focusedWindow == self
+    if wasFocused then
         Library._focusedWindow = nil
     end
+    if self._themeRestore then
+        local restore = self._themeRestore
+        self._themeRestore = nil
+        Library:SetTheme(restore)
+    end
+    for index = #Library._specControls, 1, -1 do
+        local instance = Library._specControls[index].Instance
+        if not instance or not instance.Parent then
+            table.remove(Library._specControls, index)
+        end
+    end
+    pruneThemeBindings()
+    local nextWindow = Library._windowOrder[1]
+    if wasFocused and nextWindow and not Library._destroyed then
+        Library:FocusWindow(nextWindow)
+    end
+end
+
+local function coerceUDim2(value)
+    if typeof(value) == "UDim2" then
+        return value
+    end
+    if type(value) == "table" and #value == 4 then
+        local a, b, c, d = tonumber(value[1]), tonumber(value[2]), tonumber(value[3]), tonumber(value[4])
+        if a and b and c and d then
+            return UDim2.new(a, b, c, d)
+        end
+    end
+    return nil
 end
 
 function Library:CreateWindow(options)
     options = options or {}
-    local size = options.Size or UDim2.fromOffset(680, 470)
+    local size = coerceUDim2(options.Size) or UDim2.fromOffset(680, 470)
     if typeof(size) ~= "UDim2"
         or (size.X.Scale == 0 and size.X.Offset <= 0)
         or (size.Y.Scale == 0 and size.Y.Offset <= 0) then
@@ -6069,8 +6321,12 @@ function Library:CreateWindow(options)
     local sidebarOnBottom = sidebarSide == "bottom"
     local sidebarOnTop = sidebarSide == "top"
     local sidebarHorizontal = sidebarOnBottom or sidebarOnTop
-    local minimumSize = typeof(options.MinimumSize) == "Vector2"
-        and options.MinimumSize
+    local minimumInput = options.MinimumSize
+    if type(minimumInput) == "table" and tonumber(minimumInput[1]) and tonumber(minimumInput[2]) then
+        minimumInput = Vector2.new(tonumber(minimumInput[1]), tonumber(minimumInput[2]))
+    end
+    local minimumSize = typeof(minimumInput) == "Vector2"
+        and minimumInput
         or Vector2.new(520, 360)
     minimumSize = Vector2.new(
         math.clamp(minimumSize.X, 240, 4096),
@@ -6083,7 +6339,7 @@ function Library:CreateWindow(options)
     local root = new("Frame", {
         Name = options.Title or "Bloodshot",
         AnchorPoint = Vector2.new(0.5, 0.5),
-        Position = options.Position or UDim2.fromScale(0.5, 0.5),
+        Position = coerceUDim2(options.Position) or UDim2.fromScale(0.5, 0.5),
         Size = size,
         BackgroundTransparency = 0,
         BorderSizePixel = 0,
@@ -6215,7 +6471,9 @@ function Library:CreateWindow(options)
         if tweenInfo and target then
             local backgroundTween = TweenService:Create(tweenTarget, tweenInfo, target)
             table.insert(backgroundTweens, backgroundTween)
-            backgroundTween:Play()
+            if not Library._reducedMotion then
+                backgroundTween:Play()
+            end
         end
     end
 
@@ -6281,7 +6539,9 @@ function Library:CreateWindow(options)
                 }
             )
             table.insert(backgroundTweens, animation)
-            animation:Play()
+            if not Library._reducedMotion then
+                animation:Play()
+            end
         end
     end
 
@@ -6678,7 +6938,8 @@ function Library:CreateWindow(options)
     end, connections)
     connect(UserInputService.InputBegan, function(input, processed)
         if processed then return end
-        if comboMatches(toggleCombo, input, heldKeys) then
+        local combo = window._toggleCombo
+        if combo and comboMatches(combo, input, heldKeys) then
             window:Toggle()
         end
     end, connections)
@@ -6705,11 +6966,14 @@ function Library:Destroy()
     if self._destroyed then return end
     self._destroyed = true
     self:AutoSave(nil)
-    for _, binding in ipairs(self._bindings or {}) do
-        if binding.Unbind then binding.Unbind() end
+    self:Unbind()
+    for _, entry in ipairs(self._controlDisposers) do
+        if type(entry.Dispose) == "function" then
+            pcall(entry.Dispose)
+        end
     end
-    table.clear(self._bindings or {})
-    table.clear(self._dependencySubs or {})
+    table.clear(self._controlDisposers)
+    table.clear(self._dependencySubs)
     for _, connection in ipairs(self._connections) do
         connection:Disconnect()
     end
@@ -6727,10 +6991,12 @@ function Library:Destroy()
     end
     table.clear(self._windowOrder)
     self._focusedWindow = nil
+    self._clickGuard = nil
     table.clear(self._themeBindings)
     table.clear(self._flagSetters)
     table.clear(self._flagListeners)
-    table.clear(self._hooked)
+    table.clear(self._flagTypes)
+    table.clear(self._specControls)
     table.clear(self._notifications)
     self._configAdapter = nil
     self:_clearListeners()
@@ -6845,7 +7111,13 @@ function Library:Build(spec)
             end
         end
     end
-    for flag, value in pairs(spec.Flags or {}) do
+    for flag, value in pairs(type(spec.Flags) == "table" and spec.Flags or {}) do
+        local expected = self._flagTypes[flag]
+        if type(value) == "string" and expected == "Color3" then
+            value = parseHexColor(value) or value
+        elseif type(value) == "string" and expected == "EnumItem" then
+            value = parseKeyName(value) or value
+        end
         self:SetFlag(flag, value, true)
     end
     return result
@@ -6874,6 +7146,8 @@ local function exportableValue(value, depth)
             math.floor(value.B * 255 + 0.5))
     elseif kind == "EnumItem" then
         return tostring(value)
+    elseif kind == "UDim2" then
+        return { value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset }
     elseif kind == "number" or kind == "string" or kind == "boolean" then
         return value
     elseif kind == "table" then
@@ -6912,6 +7186,9 @@ function Library:ExportSpec(target, options)
     end
     if type(window) ~= "table" or not window.Tabs then
         return nil, "ExportSpec expects a window"
+    end
+    if window._destroyed or not window.Root then
+        return nil, "ExportSpec cannot read a destroyed window"
     end
     local function clean(entry, extra)
         local result = {}
