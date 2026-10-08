@@ -8,6 +8,7 @@ local UserInputService = game:GetService("UserInputService")
 local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 local GuiService = game:GetService("GuiService")
+local TextService = game:GetService("TextService")
 local CoreGui = game:GetService("CoreGui")
 
 local LocalPlayer = Players.LocalPlayer
@@ -48,6 +49,7 @@ local Library = {
         Reset = "Reset",
         Notification = "Notification",
         EnterValue = "Enter value...",
+        Search = "Search",
         SearchPlaceholder = "Search...",
         SelectPlaceholder = "Select...",
         NoOptions = "No options",
@@ -403,6 +405,16 @@ local function text(parent, value, size, colorKey, properties)
         bindTheme(label, "TextColor3", "Text")
     end
     return label
+end
+
+local function measureText(content, size, font, width)
+    local ok, bounds = pcall(function()
+        return TextService:GetTextSize(content, size, font, Vector2.new(width, 10000))
+    end)
+    if ok and typeof(bounds) == "Vector2" then
+        return bounds
+    end
+    return Vector2.new(math.min(width, #content * size * 0.55), size * 1.3)
 end
 
 local function ripple(button, inputPosition)
@@ -1872,6 +1884,7 @@ function Library:Confirm(options)
         Parent = overlay,
     })
     bindTheme(card, "BackgroundColor3", "Surface")
+    gradient(card, "Surface", "SurfaceGradient", 18)
     corner(card, 9)
     stroke(card, self.Theme.Border, 1, 0.1, "Border")
     text(card, options.Title or T("Confirm"), 16, "Text", {
@@ -1901,6 +1914,10 @@ function Library:Confirm(options)
         Text = options.ConfirmText or T("Confirm"), TextColor3 = self.Theme.Text,
         Font = Enum.Font.GothamMedium, TextSize = 12, ZIndex = 102, Parent = card,
     })
+    bindTheme(cancel, "BackgroundColor3", "SurfaceAlt")
+    bindTheme(cancel, "TextColor3", "MutedText")
+    bindTheme(confirm, "BackgroundColor3", "Accent")
+    bindTheme(confirm, "TextColor3", "Text")
     corner(cancel, 6); corner(confirm, 6)
     connect(cancel.Activated, function() resolve(false) end)
     connect(confirm.Activated, function() resolve(true) end)
@@ -1974,12 +1991,10 @@ local function compactifyControl(holder, rowHeight)
     holder.Size = UDim2.new(1, 0, 1, 0)
     holder:SetAttribute("BloodshotCompact", true)
     -- Compact children are chrome-free: the row already provides the surface, so
-    -- a second bordered card inside it reads as clutter. Drop the fill, gradient
-    -- and stroke rather than only fading them.
+    -- a second bordered card inside it reads as clutter. Drop the holder's fill,
+    -- gradient and stroke; parts a control outlines on purpose keep theirs.
     holder.BackgroundTransparency = 1
-    -- Strip edges from the whole subtree, not just the holder: several controls
-    -- outline their own parts (the colour preview, keybind box, slider knob).
-    for _, effect in ipairs(holder:GetDescendants()) do
+    for _, effect in ipairs(holder:GetChildren()) do
         if effect:IsA("UIStroke") or effect:IsA("UIGradient") then
             effect:Destroy()
         end
@@ -1988,36 +2003,85 @@ local function compactifyControl(holder, rowHeight)
     local seenLabel = 0
     for _, child in ipairs(holder:GetChildren()) do
         if child:IsA("TextLabel") then
-            seenLabel += 1
-            if seenLabel == 1 then
-                nameLabel = child
-                -- Name fills the row height and centres, keeping its designed
-                -- width so it never slides under the interactive part.
+            if child:GetAttribute("BloodshotKeep") then
+                -- Value readouts and arrows keep the horizontal layout their
+                -- control gave them; only the vertical centring is shared.
                 child.AnchorPoint = Vector2.new(child.AnchorPoint.X, 0.5)
                 child.Position = UDim2.new(child.Position.X.Scale, child.Position.X.Offset, 0.5, 0)
-                child.Size = UDim2.new(child.Size.X.Scale, child.Size.X.Offset, 1, 0)
             else
-                -- No room for descriptions inside a single row.
-                child.Visible = false
+                seenLabel += 1
+                if seenLabel == 1 then
+                    nameLabel = child
+                    -- Name fills the row height and centres, keeping its designed
+                    -- width so it never slides under the interactive part.
+                    child.AnchorPoint = Vector2.new(child.AnchorPoint.X, 0.5)
+                    child.Position = UDim2.new(child.Position.X.Scale, child.Position.X.Offset, 0.5, 0)
+                    child.Size = UDim2.new(child.Size.X.Scale, child.Size.X.Offset, 1, 0)
+                else
+                    -- No room for descriptions inside a single row.
+                    child.Visible = false
+                end
             end
         elseif child:IsA("GuiObject") then
-            local height = child.Size.Y.Offset
-            if child.Size.Y.Scale ~= 0 then
-                height = rowHeight
-            elseif height <= 0 or height > rowHeight then
-                height = math.min(math.max(height, 1), rowHeight)
-            end
-            -- Cap interactive parts to a sane column height so a 44px control
-            -- does not poke out of a 34px row.
-            if not child:IsA("UICorner") and not child:IsA("UIStroke") then
+            local size = child.Size
+            local fillsHolder = size.X.Scale == 1 and size.X.Offset == 0
+                and size.Y.Scale == 1 and size.Y.Offset == 0
+            if not fillsHolder then
+                local height = size.Y.Offset
+                if size.Y.Scale ~= 0 then
+                    height = rowHeight
+                elseif height <= 0 or height > rowHeight then
+                    height = math.min(math.max(height, 1), rowHeight)
+                end
+                -- Cap interactive parts to a sane column height so a 44px control
+                -- does not poke out of a 34px row.
                 height = math.min(height, math.max(18, rowHeight - 8))
+                child.AnchorPoint = Vector2.new(child.AnchorPoint.X, 0.5)
+                child.Position = UDim2.new(child.Position.X.Scale, child.Position.X.Offset, 0.5, 0)
+                child.Size = UDim2.new(size.X.Scale, size.X.Offset, 0, height)
             end
-            child.AnchorPoint = Vector2.new(child.AnchorPoint.X, 0.5)
-            child.Position = UDim2.new(child.Position.X.Scale, child.Position.X.Offset, 0.5, 0)
-            child.Size = UDim2.new(child.Size.X.Scale, child.Size.X.Offset, 0, height)
         end
     end
     return nameLabel
+end
+
+-- Dims a control while it or its section is disabled. The veil also sinks
+-- input, so nothing underneath it can be clicked or dragged.
+local function refreshVeil(holder)
+    if not holder or not holder.Parent or not holder:IsA("GuiObject") then return end
+    if holder:FindFirstChildOfClass("UIListLayout") then return end
+    local disabled = holder:GetAttribute("BloodshotDisabled") == true
+        or holder:GetAttribute("BloodshotSectionDisabled") == true
+    local veil = holder:FindFirstChild("DisabledVeil")
+    if disabled and not veil then
+        veil = new("Frame", {
+            Name = "DisabledVeil",
+            BackgroundTransparency = 0.45,
+            BorderSizePixel = 0,
+            Active = true,
+            ZIndex = 50,
+            Parent = holder,
+        })
+        bindTheme(veil, "BackgroundColor3", "Background")
+        corner(veil, 6)
+        local inset = holder:FindFirstChildOfClass("UIPadding")
+        local left = inset and inset.PaddingLeft.Offset or 0
+        local top = inset and inset.PaddingTop.Offset or 0
+        local right = inset and inset.PaddingRight.Offset or 0
+        local bottom = inset and inset.PaddingBottom.Offset or 0
+        veil.Position = UDim2.fromOffset(-left, -top)
+        veil.Size = UDim2.new(1, left + right, 1, top + bottom)
+    end
+    if veil then veil.Visible = disabled end
+end
+
+local function ownerDisabled(object, stopAt)
+    local node = object.Parent
+    while node and node ~= stopAt do
+        if node:GetAttribute("BloodshotDisabled") == true then return true end
+        node = node.Parent
+    end
+    return false
 end
 
 -- LayoutOrder drives the visual order; GetChildren() keeps creation order.
@@ -2208,6 +2272,13 @@ end
 --       { Type = "Toggle", Name = "icons" },
 --   } })
 -- Width accepts a number of pixels or a UDim2; the remainder is shared evenly.
+local ROW_NAME_MIN_WIDTH = 150
+local COMPACT_MARGIN = 4
+
+local function setWidth(object, scale, offset)
+    object.Size = UDim2.new(scale, offset, object.Size.Y.Scale, object.Size.Y.Offset)
+end
+
 function Section:AddRow(options)
     options = type(options) == "table" and options or { Controls = options }
     local rowHeight = math.clamp(tonumber(options.Height) or 34, 24, 120)
@@ -2222,7 +2293,15 @@ function Section:AddRow(options)
     bindTheme(holder, "BackgroundColor3", "SurfaceAlt")
     gradient(holder, "SurfaceAlt", "SurfaceGradient", 12)
     corner(holder, 6)
-    stroke(holder, Library.Theme.Border, 1, 0.45, "Border")
+    local rowStroke = stroke(holder, Library.Theme.Border, 1, 0.45, "Border")
+    connect(holder.MouseEnter, function()
+        tween(holder, 0.16, { BackgroundTransparency = 0.68 })
+        tween(rowStroke, 0.16, { Transparency = 0.2 })
+    end, self.Window._connections)
+    connect(holder.MouseLeave, function()
+        tween(holder, 0.16, { BackgroundTransparency = Library.Theme.ControlTransparency or 0.8 })
+        tween(rowStroke, 0.16, { Transparency = 0.45 })
+    end, self.Window._connections)
     holder:SetAttribute("BloodshotControl", true)
     holder:SetAttribute("BloodshotRow", true)
     holder:SetAttribute("BloodshotCompact", true)
@@ -2270,9 +2349,14 @@ function Section:AddRow(options)
     local function buildRowChild(index, childOptions, window)
         local childType = childOptions.Type or childOptions.type or childOptions.Control
         childOptions.Type, childOptions.type, childOptions.Control = nil, nil, nil
-        local method = childType and Section[controlMethodName(tostring(childType))]
+        local methodKey = childType and controlMethodName(tostring(childType))
+        local method = methodKey and Section[methodKey]
         if type(method) ~= "function" then
             warn("[Bloodshot UI] AddRow: unknown control type " .. tostring(childType))
+            return nil
+        end
+        if methodKey == "AddList" or methodKey == "AddRow" then
+            warn("[Bloodshot UI] AddRow: " .. tostring(childType) .. " does not fit in a row")
             return nil
         end
         local weight = math.max(0.01, tonumber(childOptions.Weight) or 1)
@@ -2303,57 +2387,18 @@ function Section:AddRow(options)
             slot:Destroy()
             return nil
         end
-        local rowNameLabel = compactifyControl(result.Instance, rowHeight)
-        -- Give every compact child a small uniform inset so controls do not sit
-        -- flush against the slot edge, and keep the name clear of the
-        -- interactive part instead of letting the two overlap.
-        local inset = math.clamp(math.floor((rowHeight - 20) / 2), 2, 8)
-        local columnWidth = result.Instance.AbsoluteSize.X
-        if columnWidth <= 0 then columnWidth = width or (rowHeight * 2) end
-        for _, part in ipairs(result.Instance:GetChildren()) do
-            if part:IsA("GuiObject") and not part:IsA("UICorner")
-                and not part:IsA("UIStroke") and not part:IsA("UIGradient")
-                and not part:IsA("UIPadding") and not part:IsA("UIScale") then
-                -- Scale-sized parts (the 52% interactive split and the full-width
-                -- name) stay proportional; only offset-sized ones get the inset.
-                -- Shrinking the scale instead of the offset is what keeps a
-                -- full-width label from sliding under the control on its right.
-                if part.Size.X.Scale ~= 0 then
-                    local insetScale = inset / math.max(1, columnWidth)
-                    part.Position = UDim2.new(part.Position.X.Scale, part.Position.X.Offset + inset, 0.5, 0)
-                    part.Size = UDim2.new(
-                        math.max(0.05, part.Size.X.Scale - insetScale * 2),
-                        part.Size.X.Offset,
-                        0,
-                        part.Size.Y.Offset
-                    )
-                else
-                    part.Position = UDim2.new(0, part.Position.X.Offset + inset, 0.5, 0)
-                    part.Size = UDim2.new(0, math.max(8, part.Size.X.Offset - inset * 2), 0, part.Size.Y.Offset)
-                end
-            end
+        compactifyControl(result.Instance, rowHeight)
+        -- Names only show once the column is wide enough to hold them next to the
+        -- control; the control lays itself out for either case. Slot widths are
+        -- not known until the first layout pass, so this runs again on resize.
+        local function refreshColumn()
+            if not slot.Parent or type(result.CompactLayout) ~= "function" then return end
+            local available = slot.AbsoluteSize.X
+            if available <= 0 then available = width or 0 end
+            result:CompactLayout(available <= 0 or available >= ROW_NAME_MIN_WIDTH, available > 0 and available or nil)
         end
-        -- A name and an interactive part cannot share a column: whichever is
-        -- wider would overlap the other. Fixed columns below ~150px keep only
-        -- the control (the value is the point); wider ones keep only the name,
-        -- because a bare label reads better than a nameless control. The slot
-        -- keeps its width either way, so the row layout does not shift.
-        if rowNameLabel then
-            local columnIsFixed = width ~= nil
-            local hasControl = false
-            for _, part in ipairs(result.Instance:GetChildren()) do
-                if (part:IsA("GuiButton") or part:IsA("TextBox")) and part.Visible then
-                    hasControl = true
-                    break
-                end
-            end
-            if hasControl then
-                local effective = columnIsFixed and width or columnWidth
-                if effective < 150 then
-                    rowNameLabel.Visible = false
-                end
-            end
-        end
+        refreshColumn()
+        connect(slot:GetPropertyChangedSignal("AbsoluteSize"), refreshColumn, window._connections)
         result.Window = window
         -- Section.Add* is the enriched wrapper, so the child already carries the full
         -- control contract. It does not join section.Controls (those are the
@@ -2413,11 +2458,16 @@ end
 
 function Section:AddLabel(options)
     options = type(options) == "table" and options or { Text = tostring(options) }
-    local label = text(self.Container, options.Text or options.Name or "Label", options.TextSize or 12, options.Color or "MutedText", {
+    local compact = self._compact == true
+    local label = text(self.Container, options.Text or options.Name or "Label", options.TextSize or 12, options.Color or (compact and "Text" or "MutedText"), {
         Size = UDim2.new(1, 0, 0, options.Height or 24),
         TextWrapped = options.Wrap == true,
         TextXAlignment = options.Alignment or Enum.TextXAlignment.Left,
+        Font = compact and Library.Theme.FontMedium or nil,
     })
+    if compact then
+        padding(label, 0, 0, 0, COMPACT_MARGIN)
+    end
     return {
         Instance = label,
         Set = function(_, value)
@@ -2442,6 +2492,7 @@ function Section:AddParagraph(options)
     titleLabel.Size = UDim2.new(1, -24, 0, 18)
     titleLabel.TextYAlignment = Enum.TextYAlignment.Center
     local body = text(holder, options.Content or options.Text or "", 11, "MutedText", {
+        Font = options.Font,
         Position = UDim2.fromOffset(12, 29),
         Size = automaticHeight and UDim2.new(1, -24, 0, 9) or UDim2.new(1, -24, 1, -38),
         AutomaticSize = automaticHeight and Enum.AutomaticSize.Y or Enum.AutomaticSize.None,
@@ -2459,12 +2510,15 @@ end
 
 function Section:AddButton(options)
     options = type(options) == "table" and options or { Name = tostring(options) }
-    local holder, nameLabel = createControlBase(self, options.Description and 52 or 40, options.Name or "Button", options.Description)
+    local holder, nameLabel, descriptionLabel = createControlBase(self, options.Description and 52 or 40, options.Name or "Button", options.Description)
     local buttonScale = new("UIScale", {
         Scale = 1,
         Parent = holder,
     })
     nameLabel.Size = UDim2.new(1, -52, nameLabel.Size.Y.Scale, nameLabel.Size.Y.Offset)
+    if descriptionLabel then
+        descriptionLabel.Size = UDim2.new(1, -52, 0, 16)
+    end
     local arrow = text(holder, "\u{203A}", 22, "MutedText", {
         AnchorPoint = Vector2.new(1, 0.5),
         Position = UDim2.new(1, -12, 0.5, 0),
@@ -2479,6 +2533,26 @@ function Section:AddButton(options)
         ZIndex = 4,
         Parent = holder,
     })
+    local compact = self._compact == true
+    local pill
+    if compact then
+        pill = new("Frame", {
+            Name = "Pill",
+            AnchorPoint = Vector2.new(0, 0.5),
+            Position = UDim2.new(0, 0, 0.5, 0),
+            Size = UDim2.new(1, 0, 1, -8),
+            BackgroundTransparency = 0.55,
+            BorderSizePixel = 0,
+            ZIndex = 0,
+            Parent = holder,
+        })
+        bindTheme(pill, "BackgroundColor3", "Border")
+        corner(pill, 5)
+        nameLabel.Position = UDim2.new()
+        nameLabel.Size = UDim2.fromScale(1, 1)
+        nameLabel.TextXAlignment = Enum.TextXAlignment.Center
+        arrow.Visible = false
+    end
     local armed = false
     local armTimer
     local function disarm()
@@ -2508,14 +2582,22 @@ function Section:AddButton(options)
     end
     connect(button.MouseEnter, function()
         if not armed then
-            tween(holder, 0.15, { BackgroundColor3 = Library.Theme.Border })
-            tween(arrow, 0.15, { Position = UDim2.new(1, -8, 0.5, 0) })
+            if pill then
+                tween(pill, 0.15, { BackgroundTransparency = 0.3 })
+            else
+                tween(holder, 0.15, { BackgroundColor3 = Library.Theme.Border })
+                tween(arrow, 0.15, { Position = UDim2.new(1, -8, 0.5, 0) })
+            end
         end
     end, self.Window._connections)
     connect(button.MouseLeave, function()
         if not armed then
-            tween(holder, 0.15, { BackgroundColor3 = Library.Theme.SurfaceAlt })
-            tween(arrow, 0.15, { Position = UDim2.new(1, -12, 0.5, 0) })
+            if pill then
+                tween(pill, 0.15, { BackgroundTransparency = 0.55 })
+            else
+                tween(holder, 0.15, { BackgroundColor3 = Library.Theme.SurfaceAlt })
+                tween(arrow, 0.15, { Position = UDim2.new(1, -12, 0.5, 0) })
+            end
         end
     end, self.Window._connections)
     connect(button.Activated, function(input)
@@ -2556,8 +2638,11 @@ end
 
 function Section:AddToggle(options)
     options = options or {}
-    local holder, nameLabel = createControlBase(self, options.Description and 52 or 40, options.Name or "Toggle", options.Description)
+    local holder, nameLabel, descriptionLabel = createControlBase(self, options.Description and 52 or 40, options.Name or "Toggle", options.Description)
     nameLabel.Size = UDim2.new(1, -68, nameLabel.Size.Y.Scale, nameLabel.Size.Y.Offset)
+    if descriptionLabel then
+        descriptionLabel.Size = UDim2.new(1, -68, 0, 16)
+    end
     local track = new("Frame", {
         AnchorPoint = Vector2.new(1, 0.5),
         Position = UDim2.new(1, -12, 0.5, 0),
@@ -2583,6 +2668,11 @@ function Section:AddToggle(options)
         ZIndex = 4,
         Parent = holder,
     })
+    if self._compact == true then
+        nameLabel.Position = UDim2.fromOffset(COMPACT_MARGIN, 0)
+        nameLabel.Size = UDim2.new(1, -(COMPACT_MARGIN * 2 + 38 + 8), 1, 0)
+        track.Position = UDim2.new(1, -COMPACT_MARGIN, 0.5, 0)
+    end
 
     local value = options.Default == true
     local function set(nextValue, silent)
@@ -2633,7 +2723,7 @@ function Section:AddSlider(options)
         maximum = minimum + 1
     end
     local holder, nameLabel = createControlBase(self, 58, options.Name or "Slider")
-    nameLabel.Size = UDim2.new(1, -80, 0, 30)
+    nameLabel.Size = UDim2.new(1, -92, 0, 30)
     local valueLabel = text(holder, "", 12, "MutedText", {
         AnchorPoint = Vector2.new(1, 0),
         Position = UDim2.new(1, -12, 0, 0),
@@ -2673,6 +2763,14 @@ function Section:AddSlider(options)
         ZIndex = 5,
         Parent = track,
     })
+    if self._compact == true then
+        nameLabel.Position = UDim2.fromOffset(COMPACT_MARGIN, 0)
+        nameLabel.Size = UDim2.new(0.3, -COMPACT_MARGIN, 1, 0)
+        valueLabel:SetAttribute("BloodshotKeep", true)
+        valueLabel.AnchorPoint = Vector2.new(1, 0.5)
+        valueLabel.Position = UDim2.new(1, -COMPACT_MARGIN, 0.5, 0)
+        valueLabel.Size = UDim2.new(0, 56, 1, 0)
+    end
 
     local value = minimum
     local dragging = false
@@ -2722,16 +2820,27 @@ function Section:AddSlider(options)
         Instance = holder,
         Set = function(_, nextValue, silent) set(nextValue, silent) end,
         Get = function() return value end,
+        CompactLayout = function(_, showName, available)
+            nameLabel.Visible = showName
+            local valueWidth = available and math.clamp(math.floor(available * 0.36), 32, 56) or 56
+            valueLabel.Size = UDim2.new(0, valueWidth, 1, 0)
+            local reserve = valueWidth + 12
+            track.Position = showName and UDim2.new(0.34, 0, 0.5, 0) or UDim2.new(0, COMPACT_MARGIN, 0.5, 0)
+            setWidth(track, showName and 0.66 or 1, -(showName and COMPACT_MARGIN + reserve or COMPACT_MARGIN * 2 + reserve))
+        end,
     }
 end
 
 function Section:AddInput(options)
     options = options or {}
-    local holder, nameLabel = createControlBase(self, options.Description and 58 or 46, options.Name or "Input", options.Description)
-    nameLabel.Size = UDim2.new(0.42, -12, nameLabel.Size.Y.Scale, nameLabel.Size.Y.Offset)
+    local holder, nameLabel, descriptionLabel = createControlBase(self, options.Description and 58 or 46, options.Name or "Input", options.Description)
+    nameLabel.Size = UDim2.new(0.4, -12, nameLabel.Size.Y.Scale, nameLabel.Size.Y.Offset)
+    if descriptionLabel then
+        descriptionLabel.Size = UDim2.new(0.4, -12, 0, 16)
+    end
     local box = new("TextBox", {
         AnchorPoint = Vector2.new(1, 0.5),
-        Position = UDim2.new(1, -10, 0.5, 0),
+        Position = UDim2.new(1, -12, 0.5, 0),
         Size = UDim2.new(0.52, 0, 0, 28),
         BackgroundTransparency = 0,
         BorderSizePixel = 0,
@@ -2749,6 +2858,11 @@ function Section:AddInput(options)
     bindTheme(box, "PlaceholderColor3", "MutedText")
     corner(box, 5)
     padding(box, 0, 8, 0, 8)
+    if self._compact == true then
+        nameLabel.Position = UDim2.fromOffset(COMPACT_MARGIN, 0)
+        nameLabel.Size = UDim2.new(0.4, -COMPACT_MARGIN, 1, 0)
+        box.Position = UDim2.new(1, -COMPACT_MARGIN, 0.5, 0)
+    end
 
     local value = box.Text
     local normalize = type(options.Normalize) == "function" and options.Normalize or nil
@@ -2806,6 +2920,11 @@ function Section:AddInput(options)
         Instance = holder,
         Set = function(_, nextValue, silent) set(nextValue, silent) end,
         Get = function() return value end,
+        CompactLayout = function(_, showName)
+            nameLabel.Visible = showName
+            box.Position = UDim2.new(1, -COMPACT_MARGIN, 0.5, 0)
+            setWidth(box, showName and 0.56 or 1, showName and -COMPACT_MARGIN or -COMPACT_MARGIN * 2)
+        end,
     }
 end
 
@@ -2816,11 +2935,12 @@ function Section:AddDropdown(options)
     local selected = multi and {} or nil
     local open = false
     local baseHeight = 46
+    local compact = self._compact == true
     local holder, nameLabel = createControlBase(self, baseHeight, options.Name or "Dropdown")
-    nameLabel.Size = UDim2.new(0.42, -12, 0, baseHeight)
+    nameLabel.Size = UDim2.new(0.4, -12, 0, baseHeight)
     local display = new("TextButton", {
         AnchorPoint = Vector2.new(1, 0),
-        Position = UDim2.new(1, -10, 0, 9),
+        Position = UDim2.new(1, -12, 0, 9),
         Size = UDim2.new(0.52, 0, 0, 28),
         BackgroundTransparency = 0,
         BorderSizePixel = 0,
@@ -2842,26 +2962,62 @@ function Section:AddDropdown(options)
     })
     local arrow = text(holder, "▼", 11, "MutedText", {
         AnchorPoint = Vector2.new(1, 0.5),
-        Position = UDim2.new(1, -14, 0, 23),
+        Position = UDim2.new(1, -16, 0, 23),
         Size = UDim2.fromOffset(16, 18),
         TextXAlignment = Enum.TextXAlignment.Center,
         ZIndex = 3,
     })
+    -- A row clips everything it holds, so a row child opens its list on the
+    -- window root instead of growing its own holder.
     local list = new("ScrollingFrame", {
         Visible = false,
-        Position = UDim2.fromOffset(10, baseHeight),
-        Size = UDim2.new(1, -20, 0, 0),
+        Position = UDim2.fromOffset(12, baseHeight),
+        Size = UDim2.new(1, -24, 0, 0),
         BackgroundTransparency = 0,
         BorderSizePixel = 0,
         ScrollBarThickness = 2,
         CanvasSize = UDim2.new(),
         AutomaticCanvasSize = Enum.AutomaticSize.Y,
-        Parent = holder,
+        Active = compact,
+        ZIndex = compact and 60 or 1,
+        Parent = compact and self.Window.Root or holder,
     })
     bindTheme(list, "BackgroundColor3", "Background")
     bindTheme(list, "ScrollBarImageColor3", "Accent")
     corner(list, 5)
     padding(list, 4, 4, 4, 4)
+    if compact then
+        self._overlays = self._overlays or {}
+        table.insert(self._overlays, list)
+        stroke(list, Library.Theme.Border, 1, 0.25, "Border")
+        nameLabel.Position = UDim2.fromOffset(COMPACT_MARGIN, 0)
+        nameLabel.Size = UDim2.new(0.4, -COMPACT_MARGIN, 1, 0)
+        display.Position = UDim2.new(1, -COMPACT_MARGIN, 0, 9)
+        arrow:SetAttribute("BloodshotKeep", true)
+        arrow.Position = UDim2.new(1, -(COMPACT_MARGIN + 12), 0.5, 0)
+    end
+    local listWidth = 0
+    local listHeightNow = 0
+    local function listSize(height)
+        if compact then return UDim2.fromOffset(listWidth, height) end
+        return UDim2.new(1, -24, 0, height)
+    end
+    local function placeList()
+        if not compact or not open then return end
+        local rootFrame = self.Window.Root
+        local rootSize = rootFrame.AbsoluteSize
+        if rootSize.X <= 0 or rootSize.Y <= 0 then return end
+        local width = math.clamp(display.AbsoluteSize.X, 120, math.max(120, rootSize.X - 12))
+        local origin = display.AbsolutePosition - rootFrame.AbsolutePosition
+        local x = math.clamp(origin.X + display.AbsoluteSize.X - width, 6, math.max(6, rootSize.X - width - 6))
+        local below = origin.Y + display.AbsoluteSize.Y + 4
+        local above = origin.Y - 4
+        local flip = below + listHeightNow > rootSize.Y - 6 and above - listHeightNow >= 6
+        listWidth = width
+        list.AnchorPoint = Vector2.new(0, flip and 1 or 0)
+        list.Position = UDim2.fromOffset(x, flip and above or below)
+        list.Size = UDim2.new(0, width, 0, list.Size.Y.Offset)
+    end
     local layout = new("UIListLayout", {
         Padding = UDim.new(0, 3),
         SortOrder = Enum.SortOrder.LayoutOrder,
@@ -2885,9 +3041,11 @@ function Section:AddDropdown(options)
             TextColor3 = Library.Theme.Text,
             Font = Enum.Font.Gotham,
             TextSize = 11,
+            TextXAlignment = Enum.TextXAlignment.Left,
             Parent = list,
         })
         corner(searchBox, 4)
+        padding(searchBox, 0, 8, 0, 8)
         bindTheme(searchBox, "BackgroundColor3", "SurfaceAlt")
         bindTheme(searchBox, "PlaceholderColor3", "MutedText")
         bindTheme(searchBox, "TextColor3", "Text")
@@ -2910,8 +3068,13 @@ function Section:AddDropdown(options)
         if open then
             local searchHeight = searchBox and 29 or 0
             local height = (count == 0 and 36 or math.min(count, maxVisibleRows) * 28 + 8) + searchHeight
-            list.Size = UDim2.new(1, -20, 0, height)
-            holder.Size = UDim2.new(1, 0, 0, baseHeight + height + 8)
+            listHeightNow = height
+            list.Size = listSize(height)
+            if compact then
+                placeList()
+            else
+                holder.Size = UDim2.new(1, 0, 0, baseHeight + height + 8)
+            end
         end
         return count
     end
@@ -2976,26 +3139,32 @@ function Section:AddDropdown(options)
         local listHeight = math.min(#values, maxVisibleRows) * 28 + 8 + (searchBox and 29 or 0)
         if #values == 0 then listHeight = 36 + (searchBox and 29 or 0) end
         if open then
+            listHeightNow = listHeight
             list.Visible = true
-            list.Size = UDim2.new(1, -20, 0, 0)
+            placeList()
+            list.Size = listSize(0)
             list.BackgroundTransparency = 1
             for _, option in pairs(optionButtons) do
                 option.TextTransparency = 0.55
                 tween(option, 0.2, { TextTransparency = 0 })
             end
             tween(list, 0.2, {
-                Size = UDim2.new(1, -20, 0, listHeight),
-                BackgroundTransparency = 0.06,
+                Size = listSize(listHeight),
+                BackgroundTransparency = compact and 0 or 0.06,
             })
-            tween(holder, 0.22, {
-                Size = UDim2.new(1, 0, 0, baseHeight + listHeight + 8),
-            }, Enum.EasingStyle.Quint)
+            if not compact then
+                tween(holder, 0.22, {
+                    Size = UDim2.new(1, 0, 0, baseHeight + listHeight + 8),
+                }, Enum.EasingStyle.Quint)
+            end
         else
             local animation = tween(list, 0.16, {
-                Size = UDim2.new(1, -20, 0, 0),
+                Size = listSize(0),
                 BackgroundTransparency = 1,
             })
-            tween(holder, 0.18, { Size = UDim2.new(1, 0, 0, baseHeight) })
+            if not compact then
+                tween(holder, 0.18, { Size = UDim2.new(1, 0, 0, baseHeight) })
+            end
             animation.Completed:Connect(function()
                 if not open then list.Visible = false end
             end)
@@ -3014,7 +3183,7 @@ function Section:AddDropdown(options)
                 Size = UDim2.new(1, 0, 0, 25),
                 AutoButtonColor = false,
                 Font = Enum.Font.Gotham,
-                Text = "  " .. tostring(item),
+                Text = tostring(item),
                 TextSize = 11,
                 TextXAlignment = Enum.TextXAlignment.Left,
                 LayoutOrder = index,
@@ -3022,6 +3191,7 @@ function Section:AddDropdown(options)
             })
             constrainText(option, 8, 11)
             corner(option, 4)
+            padding(option, 0, 8, 0, 8)
             local optionScale = new("UIScale", {
                 Scale = 1,
                 Parent = option,
@@ -3090,17 +3260,40 @@ function Section:AddDropdown(options)
             return
         end
         local point = input.Position
-        local topLeft = holder.AbsolutePosition
-        local bottomRight = topLeft + holder.AbsoluteSize
-        if point.X < topLeft.X or point.X > bottomRight.X or point.Y < topLeft.Y or point.Y > bottomRight.Y then
+        local function within(object)
+            local topLeft = object.AbsolutePosition
+            local bottomRight = topLeft + object.AbsoluteSize
+            return point.X >= topLeft.X and point.X <= bottomRight.X
+                and point.Y >= topLeft.Y and point.Y <= bottomRight.Y
+        end
+        if not within(holder) and not (compact and within(list)) then
             setOpen(false)
         end
     end, self.Window._connections)
+    if compact then
+        local page = self.Tab and self.Tab.Page
+        if page then
+            connect(page:GetPropertyChangedSignal("CanvasPosition"), placeList, self.Window._connections)
+            connect(page:GetPropertyChangedSignal("Visible"), function()
+                if not page.Visible then setOpen(false) end
+            end, self.Window._connections)
+        end
+        connect(self.Window.Root:GetPropertyChangedSignal("AbsoluteSize"), placeList, self.Window._connections)
+        connect(self.Window.Pages:GetPropertyChangedSignal("Visible"), function()
+            if not self.Window.Pages.Visible then setOpen(false) end
+        end, self.Window._connections)
+    end
     rebuild(values)
     set(options.Default, true)
     registerFlagSetter(self.Window, options.Flag, set)
     return {
         Instance = holder,
+        Panel = compact and list or nil,
+        CompactLayout = function(_, showName)
+            nameLabel.Visible = showName
+            display.Position = UDim2.new(1, -COMPACT_MARGIN, 0.5, 0)
+            setWidth(display, showName and 0.56 or 1, showName and -COMPACT_MARGIN or -COMPACT_MARGIN * 2)
+        end,
         Set = function(_, nextValue, silent) set(nextValue, silent) end,
         Get = outputValue,
         Refresh = function(_, nextValues, keepSelection)
@@ -3122,12 +3315,12 @@ end
 
 function Section:AddKeybind(options)
     options = options or {}
-    local holder, nameLabel = createControlBase(self, 42, options.Name or "Keybind")
-    nameLabel.Size = UDim2.new(1, -120, 1, 0)
+    local holder, nameLabel = createControlBase(self, 46, options.Name or "Keybind")
+    nameLabel.Size = UDim2.new(1, -124, 1, 0)
     local keyButton = new("TextButton", {
         AnchorPoint = Vector2.new(1, 0.5),
-        Position = UDim2.new(1, -10, 0.5, 0),
-        Size = UDim2.fromOffset(92, 26),
+        Position = UDim2.new(1, -12, 0.5, 0),
+        Size = UDim2.fromOffset(92, 28),
         BackgroundTransparency = 0,
         BorderSizePixel = 0,
         AutoButtonColor = false,
@@ -3138,6 +3331,11 @@ function Section:AddKeybind(options)
     constrainText(keyButton, 8, 11)
     bindTheme(keyButton, "BackgroundColor3", "Background")
     corner(keyButton, 5)
+    if self._compact == true then
+        nameLabel.Position = UDim2.fromOffset(COMPACT_MARGIN, 0)
+        nameLabel.Size = UDim2.new(1, -(COMPACT_MARGIN * 2 + 80 + 8), 1, 0)
+        keyButton.Position = UDim2.new(1, -COMPACT_MARGIN, 0.5, 0)
+    end
     -- A key *name* is accepted as well as a KeyCode so a spec that came out of
     -- ExportSpec (which stores enums as strings) can go straight back into Build.
     local defaultKey = options.Default
@@ -3288,6 +3486,10 @@ function Section:AddKeybind(options)
         Instance = holder,
         Set = function(_, nextValue, silent) set(nextValue, silent) end,
         Get = function() return value end,
+        CompactLayout = function(_, showName)
+            nameLabel.Visible = showName
+            setWidth(keyButton, showName and 0 or 1, showName and 80 or -COMPACT_MARGIN * 2)
+        end,
         -- Method form: HandleInput is called as control:HandleInput(input, processed),
         -- so the leading self has to be dropped.
         HandleInput = function(_, input, processed)
@@ -3323,13 +3525,14 @@ end
 
 function Section:AddColorPicker(options)
     options = options or {}
-    local holder, nameLabel = createControlBase(self, 44, options.Name or "Color")
-    nameLabel.Size = UDim2.new(1, -70, 1, 0)
+    local holder, nameLabel = createControlBase(self, 46, options.Name or "Color")
+    nameLabel.Size = UDim2.new(1, -78, 1, 0)
     local initialColor = typeof(options.Default) == "Color3" and options.Default or Color3.new(1, 1, 1)
+    local compact = self._compact == true
     local preview = new("TextButton", {
         AnchorPoint = Vector2.new(1, 0.5),
-        Position = UDim2.new(1, -10, 0, 22),
-        Size = UDim2.fromOffset(46, 24),
+        Position = UDim2.new(1, -12, 0.5, 0),
+        Size = UDim2.fromOffset(46, 28),
         BackgroundColor3 = initialColor,
         BorderSizePixel = 0,
         Text = "",
@@ -3339,12 +3542,18 @@ function Section:AddColorPicker(options)
     })
     corner(preview, 5)
     stroke(preview, Color3.new(1, 1, 1), 1, 0.7)
+    if compact then
+        nameLabel.Position = UDim2.fromOffset(COMPACT_MARGIN, 0)
+        nameLabel.Size = UDim2.new(1, -(COMPACT_MARGIN * 2 + 46 + 8), 1, 0)
+        preview.Position = UDim2.new(1, -COMPACT_MARGIN, 0.5, 0)
+    end
+    local PANEL_PADDING = 10
     local panel = new("Frame", {
         -- Lives on the window root, not inside the control: the row clips its
         -- own descendants and every later row draws over it, so an in-row panel
         -- ends up cut off and half hidden behind the controls below.
         Visible = false,
-        Size = UDim2.fromOffset(280, 176),
+        Size = UDim2.fromOffset(280, 196),
         BackgroundTransparency = 0,
         BorderSizePixel = 0,
         Active = true,
@@ -3353,11 +3562,15 @@ function Section:AddColorPicker(options)
     })
     self._overlays = self._overlays or {}
     table.insert(self._overlays, panel)
-    bindTheme(panel, "BackgroundColor3", "Background")
-    corner(panel, 5)
-    -- No UIPadding here: every child is absolutely positioned, and padding
-    -- would silently shift all of them by 10px while PANEL_HEIGHT below is
-    -- computed from the raw offsets.
+    bindTheme(panel, "BackgroundColor3", "Surface")
+    corner(panel, 6)
+    stroke(panel, Library.Theme.Border, 1, 0.25, "Border")
+    padding(panel, PANEL_PADDING, PANEL_PADDING, PANEL_PADDING, PANEL_PADDING)
+    text(panel, options.Name or "Color", 11, "Text", {
+        Size = UDim2.new(1, -56, 0, 20),
+        Font = Enum.Font.GothamMedium,
+        ZIndex = 4,
+    })
     local labels = { "R", "G", "B" }
     local boxes = {}
     local value = initialColor
@@ -3379,26 +3592,33 @@ function Section:AddColorPicker(options)
     -- through GetPresets/SetPreset so existing scripts keep working.
     local presetColumns = math.clamp(math.floor(tonumber(options.PresetColumns) or 8), 1, 16)
     local presetSwatches = {}
-    -- RGB labels (18) + boxes (36..61) + SV square (68..140) + footer (146..170)
-    -- + bottom padding. Footer is laid out from the bottom edge so it can never
-    -- overlap the SV square.
+    -- Header (0..20), RGB labels (24..38), boxes (40..65), SV square
+    -- (72..144) and the footer row below it, all inside the panel padding. The
+    -- footer is laid out from the bottom edge so it can never overlap the
+    -- SV square.
+    local SV_TOP = 72
+    local SV_HEIGHT = 72
     local FOOTER_HEIGHT = 24
-    local FOOTER_BOTTOM = 10
     local FOOTER_GAP = 8
-    -- SV square ends at 140 (offset 68 + height 72). The footer goes below it,
-    -- so the panel has to be tall enough to hold both plus the gap.
-    local PANEL_HEIGHT = 140 + FOOTER_GAP + FOOTER_HEIGHT + FOOTER_BOTTOM
+    local PANEL_HEIGHT = PANEL_PADDING * 2 + SV_TOP + SV_HEIGHT + FOOTER_GAP + FOOTER_HEIGHT
     local function placePanel()
         if not open then return end
         local rootFrame = self.Window.Root
         local rootSize = rootFrame.AbsoluteSize
         if rootSize.X <= 0 or rootSize.Y <= 0 then return end
-        local width = math.clamp(holder.AbsoluteSize.X - 20, 200, math.max(200, rootSize.X - 16))
-        local x = holder.AbsolutePosition.X - rootFrame.AbsolutePosition.X + 10
-        local y = holder.AbsolutePosition.Y - rootFrame.AbsolutePosition.Y + 44
+        local origin = holder.AbsolutePosition - rootFrame.AbsolutePosition
+        local width, x
+        if compact then
+            width = math.clamp(240, 200, math.max(200, rootSize.X - 12))
+            x = preview.AbsolutePosition.X + preview.AbsoluteSize.X - rootFrame.AbsolutePosition.X - width
+        else
+            width = math.clamp(holder.AbsoluteSize.X - 24, 220, math.max(220, rootSize.X - 12))
+            x = origin.X + 12
+        end
+        local y = origin.Y + holder.AbsoluteSize.Y + 4
         -- Flip above the control when the row sits too low in the page.
         if y + PANEL_HEIGHT > rootSize.Y - 6 then
-            y = holder.AbsolutePosition.Y - rootFrame.AbsolutePosition.Y - PANEL_HEIGHT
+            y = origin.Y - PANEL_HEIGHT - 4
         end
         panel.Size = UDim2.fromOffset(width, PANEL_HEIGHT)
         panel.Position = UDim2.fromOffset(
@@ -3417,6 +3637,9 @@ function Section:AddColorPicker(options)
     local page = self.Tab and self.Tab.Page
     if page then
         connect(page:GetPropertyChangedSignal("CanvasPosition"), placePanel, self.Window._connections)
+        connect(page:GetPropertyChangedSignal("Visible"), function()
+            if not page.Visible then setOpen(false) end
+        end, self.Window._connections)
     end
     connect(self.Window.Root:GetPropertyChangedSignal("AbsoluteSize"), placePanel, self.Window._connections)
     connect(self.Window.Pages:GetPropertyChangedSignal("Visible"), function()
@@ -3493,13 +3716,13 @@ function Section:AddColorPicker(options)
     end
     for index, channel in ipairs(labels) do
         text(panel, channel, 11, "MutedText", {
-            Position = UDim2.new((index - 1) / 3, 0, 0, 18),
-            Size = UDim2.new(1 / 3, -4, 0, 18),
+            Position = UDim2.new((index - 1) / 3, (index - 1) * 5 / 3, 0, 24),
+            Size = UDim2.new(1 / 3, -10 / 3, 0, 14),
             ZIndex = 4,
         })
         local box = new("TextBox", {
-            Position = UDim2.new((index - 1) / 3, 0, 0, 36),
-            Size = UDim2.new(1 / 3, -5, 0, 25),
+            Position = UDim2.new((index - 1) / 3, (index - 1) * 5 / 3, 0, 40),
+            Size = UDim2.new(1 / 3, -10 / 3, 0, 25),
             BackgroundColor3 = Library.Theme.SurfaceAlt,
             BorderSizePixel = 0,
             ClearTextOnFocus = false,
@@ -3523,8 +3746,8 @@ function Section:AddColorPicker(options)
         end, self.Window._connections)
     end
     local sv = new("TextButton", {
-        Position = UDim2.fromOffset(0, 68),
-        Size = UDim2.new(1, -42, 0, 72),
+        Position = UDim2.fromOffset(0, SV_TOP),
+        Size = UDim2.new(1, -42, 0, SV_HEIGHT),
         BackgroundColor3 = Color3.new(1, 1, 1),
         BorderSizePixel = 0,
         Text = "",
@@ -3550,7 +3773,7 @@ function Section:AddColorPicker(options)
     })
     corner(dark, 4)
     local hueBar = new("TextButton", {
-        Position = UDim2.new(1, -32, 0, 68), Size = UDim2.fromOffset(32, 72),
+        Position = UDim2.new(1, -32, 0, SV_TOP), Size = UDim2.fromOffset(32, SV_HEIGHT),
         BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
         Text = "", AutoButtonColor = false, ZIndex = 4, Parent = panel,
     })
@@ -3605,12 +3828,9 @@ function Section:AddColorPicker(options)
             or input.UserInputType == Enum.UserInputType.Touch then hsvDragTarget = nil end
     end, self.Window._connections)
     -- Footer row: hex readout + optional alpha on the left, Reset on the right.
-    -- Anchored to the bottom edge (1, -(FOOTER_HEIGHT + FOOTER_BOTTOM)) so it
-    -- always sits below the SV square instead of on top of the colour area.
-    -- Distance from the bottom edge to the footer's vertical centre: half its
-    -- height plus the bottom margin. Anchoring it to the bottom (rather than a
-    -- fixed offset) keeps it below the SV square for any panel height.
-    local footerY = FOOTER_HEIGHT / 2 + FOOTER_BOTTOM
+    -- Anchored to the bottom edge so it always sits below the SV square
+    -- instead of on top of the colour area.
+    local footerY = FOOTER_HEIGHT / 2
     hexLabel = text(panel, "", 11, "MutedText", {
         AnchorPoint = Vector2.new(0, 0.5),
         Position = UDim2.new(0, 0, 1, -footerY),
@@ -3680,6 +3900,11 @@ function Section:AddColorPicker(options)
         Instance = holder,
         Set = function(_, nextValue, silent) set(nextValue, silent) end,
         Get = function() return value end,
+        CompactLayout = function(_, showName, available)
+            if available then showName = available >= 100 end
+            nameLabel.Visible = showName
+            setWidth(preview, showName and 0 or 1, showName and 46 or -COMPACT_MARGIN * 2)
+        end,
         GetHSV = function() return hue, saturation, brightness end,
         SetHSV = function(_, h, s, v, silent)
             hue = math.clamp(h, 0, 1)
@@ -3732,26 +3957,35 @@ function Section:AddDivider(options)
     local holder = new("Frame", {
         Name = options.Text or "Divider",
         BackgroundTransparency = 1,
+        BorderSizePixel = 0,
         Size = UDim2.new(1, 0, 0, options.Text and 28 or 17),
         Parent = self.Container,
     })
-    local line = new("Frame", {
-        AnchorPoint = Vector2.new(0, 0.5),
-        Position = UDim2.new(0, 0, 0.5, 0),
-        Size = UDim2.new(1, 0, 0, 1),
-        BorderSizePixel = 0,
-        Parent = holder,
-    })
-    bindTheme(line, "BackgroundColor3", "Border")
+    local function addLine(anchorX, width)
+        local line = new("Frame", {
+            AnchorPoint = Vector2.new(anchorX, 0.5),
+            Position = UDim2.new(anchorX, 0, 0.5, 0),
+            Size = width,
+            BorderSizePixel = 0,
+            Parent = holder,
+        })
+        bindTheme(line, "BackgroundColor3", "Border")
+        return line
+    end
     if options.Text then
-        local caption = text(holder, options.Text, 10, "MutedText", {
+        local caption = tostring(options.Text)
+        local captionWidth = math.ceil(measureText(caption, 10, Library.Theme.Font or Enum.Font.Gotham, 1000).X) + 2
+        local side = UDim2.new(0.5, -(captionWidth / 2 + 10), 0, 1)
+        addLine(0, side)
+        addLine(1, side)
+        text(holder, caption, 10, "MutedText", {
             AnchorPoint = Vector2.new(0.5, 0.5),
             Position = UDim2.fromScale(0.5, 0.5),
-            Size = UDim2.fromOffset(math.max(70, #tostring(options.Text) * 7 + 18), 20),
+            Size = UDim2.fromOffset(captionWidth, 20),
             TextXAlignment = Enum.TextXAlignment.Center,
         })
-        bindTheme(caption, "BackgroundColor3", "Background")
-        caption.BackgroundTransparency = 0
+    else
+        addLine(0, UDim2.new(1, 0, 0, 1))
     end
     return { Instance = holder }
 end
@@ -3815,13 +4049,19 @@ function Section:AddNumberInput(options)
             local compact = self._compact == true
             local affix = text(input.Instance, "", 11, "MutedText", {
                 AnchorPoint = Vector2.new(1, 0.5),
-                Position = UDim2.new(1, -12, 0.5, 0),
-                Size = compact and UDim2.fromOffset(30, 26) or UDim2.fromOffset(76, 26),
+                Position = UDim2.new(1, compact and -COMPACT_MARGIN or -12, 0.5, 0),
+                Size = compact and UDim2.new(0, 56, 1, 0) or UDim2.fromOffset(76, 26),
                 TextXAlignment = Enum.TextXAlignment.Right,
             })
             if compact then
-                box.Position = UDim2.new(1, -46, 0.5, 0)
-                box.Size = UDim2.new(0.4, 0, 0, 26)
+                affix:SetAttribute("BloodshotKeep", true)
+                local nameLabel = input.Instance:FindFirstChildWhichIsA("TextLabel")
+                nameLabel.Size = UDim2.new(0.3, -COMPACT_MARGIN, 1, 0)
+                box.Position = UDim2.new(1, -(COMPACT_MARGIN + 62), 0.5, 0)
+                input.CompactLayout = function(_, showName)
+                    nameLabel.Visible = showName
+                    setWidth(box, showName and 0.68 or 1, -(showName and COMPACT_MARGIN + 62 or COMPACT_MARGIN * 2 + 62))
+                end
             else
                 box.Position = UDim2.new(1, -94, 0.5, 0)
                 box.Size = UDim2.fromOffset(84, 28)
@@ -3849,14 +4089,26 @@ end
 function Section:AddSegmented(options)
     options = options or {}
     local values = type(options.Values) == "table" and options.Values or {}
+    local compact = self._compact == true
     local holder, nameLabel = createControlBase(self, options.Description and 78 or 66, options.Name or "Segmented", options.Description)
-    nameLabel.Size = UDim2.new(1, -24, 0, 18)
+    if options.Description then
+        nameLabel.Size = UDim2.new(1, -24, 0, 18)
+    else
+        nameLabel.Position = UDim2.fromOffset(12, 7)
+        nameLabel.Size = UDim2.new(1, -24, 0, 20)
+    end
     local row = new("Frame", {
         BackgroundTransparency = 1,
-        Position = UDim2.new(0, 10, 1, -32),
-        Size = UDim2.new(1, -20, 0, 24),
+        Position = UDim2.new(0, 12, 1, -32),
+        Size = UDim2.new(1, -24, 0, 24),
         Parent = holder,
     })
+    if compact then
+        nameLabel.Position = UDim2.fromOffset(COMPACT_MARGIN, 0)
+        nameLabel.Size = UDim2.new(0.36, -COMPACT_MARGIN, 1, 0)
+        row.AnchorPoint = Vector2.new(1, 0)
+        row.Position = UDim2.new(1, -COMPACT_MARGIN, 0, 0)
+    end
     new("UIListLayout", {
         FillDirection = Enum.FillDirection.Horizontal,
         HorizontalAlignment = Enum.HorizontalAlignment.Center,
@@ -3881,17 +4133,19 @@ function Section:AddSegmented(options)
         render()
         if not silent then safeCall(options.Callback, value) end
     end
+    local segmentCount = math.max(1, #values)
     for _, item in ipairs(values) do
         local button = new("TextButton", {
             BackgroundColor3 = Library.Theme.Accent,
             BorderSizePixel = 0,
-            Size = UDim2.new(1 / math.max(1, #values), -5, 1, 0),
+            Size = UDim2.new(1 / segmentCount, -5 * (segmentCount - 1) / segmentCount, 1, 0),
             AutoButtonColor = false,
             Font = Enum.Font.GothamMedium,
             Text = tostring(item),
             TextSize = 10,
             Parent = row,
         })
+        constrainText(button, 7, 10)
         corner(button, 5)
         buttons[item] = button
         connect(button.Activated, function(input) if not disabled then if Library:_isObscured(self.Window, input and input.Position) then return end set(item) end end, self.Window._connections)
@@ -3903,9 +4157,155 @@ function Section:AddSegmented(options)
         Instance = holder,
         Set = function(_, nextValue, silent) set(nextValue, silent) end,
         Get = function() return value end,
+        CompactLayout = function(_, showName)
+            nameLabel.Visible = showName
+            setWidth(row, showName and 0.64 or 1, showName and -COMPACT_MARGIN or -COMPACT_MARGIN * 2)
+        end,
         SetDisabled = function(_, nextDisabled)
             disabled = not not nextDisabled
             for _, button in pairs(buttons) do button.Active = not disabled end
+        end,
+    }
+end
+
+-- Single-line form of the range slider for AddRow: one track, two knobs.
+local function buildCompactRange(section, options, minimum, maximum, default)
+    local increment = tonumber(options.Increment) or 1
+    if increment ~= increment or increment <= 0 then increment = 1 end
+    if maximum <= minimum then maximum = minimum + 1 end
+    local decimals = math.max(0, #(tostring(increment):match("%.(%d+)") or ""))
+    local holder, nameLabel = createControlBase(section, 34, options.Name or "RangeSlider")
+    nameLabel.Position = UDim2.fromOffset(COMPACT_MARGIN, 0)
+    nameLabel.Size = UDim2.new(0.3, -COMPACT_MARGIN, 1, 0)
+    local valueLabel = text(holder, "", 11, "MutedText", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -COMPACT_MARGIN, 0.5, 0),
+        Size = UDim2.new(0, 72, 1, 0),
+        TextXAlignment = Enum.TextXAlignment.Right,
+    })
+    valueLabel:SetAttribute("BloodshotKeep", true)
+    local track = new("Frame", {
+        Position = UDim2.new(0.34, 0, 0, 14),
+        Size = UDim2.new(0.66, -(COMPACT_MARGIN + 84), 0, 5),
+        BorderSizePixel = 0,
+        Parent = holder,
+    })
+    bindTheme(track, "BackgroundColor3", "Border")
+    corner(track, 999)
+    local fill = new("Frame", {
+        Size = UDim2.fromScale(1, 1),
+        BorderSizePixel = 0,
+        Parent = track,
+    })
+    bindTheme(fill, "BackgroundColor3", "Accent")
+    gradient(fill, "Accent", "AccentGradient", 0)
+    corner(fill, 999)
+    local function makeKnob()
+        local knob = new("Frame", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Size = UDim2.fromOffset(12, 12),
+            BorderSizePixel = 0,
+            Parent = track,
+        })
+        bindTheme(knob, "BackgroundColor3", "Text")
+        corner(knob, 999)
+        return knob
+    end
+    local lowKnob, highKnob = makeKnob(), makeKnob()
+    local hitbox = new("TextButton", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(0, -8),
+        Size = UDim2.new(1, 0, 1, 16),
+        Text = "",
+        ZIndex = 5,
+        Parent = track,
+    })
+
+    local lowValue, highValue = minimum, maximum
+    local function snap(number)
+        local snapped = math.floor(number / increment + 0.5) * increment
+        snapped = tonumber(string.format("%." .. decimals .. "f", snapped)) or snapped
+        return math.clamp(snapped, minimum, maximum)
+    end
+    local function format(number)
+        return string.format("%." .. decimals .. "f", number)
+    end
+    local function render()
+        local first = (lowValue - minimum) / (maximum - minimum)
+        local second = (highValue - minimum) / (maximum - minimum)
+        fill.Position = UDim2.fromScale(first, 0)
+        fill.Size = UDim2.fromScale(second - first, 1)
+        lowKnob.Position = UDim2.fromScale(first, 0.5)
+        highKnob.Position = UDim2.fromScale(second, 0.5)
+        valueLabel.Text = (options.Prefix or "") .. format(lowValue) .. " - " .. format(highValue) .. (options.Suffix or "")
+    end
+    local function publish(silent)
+        local result = { lowValue, highValue }
+        commitFlag(options.Flag, result)
+        if not silent then safeCall(options.Callback, lowValue, highValue, result) end
+    end
+    local function set(nextValue, silent)
+        if type(nextValue) ~= "table" then return end
+        local first = snap(tonumber(nextValue[1]) or minimum)
+        local second = snap(tonumber(nextValue[2]) or maximum)
+        if first > second then first, second = second, first end
+        lowValue, highValue = first, second
+        render()
+        publish(silent)
+    end
+
+    local dragging
+    local function valueAt(input)
+        local ratio = math.clamp((input.Position.X - track.AbsolutePosition.X) / math.max(1, track.AbsoluteSize.X), 0, 1)
+        return snap(minimum + (maximum - minimum) * ratio)
+    end
+    local function drag(input)
+        local target = valueAt(input)
+        if dragging == "low" then
+            lowValue = math.min(target, highValue)
+        else
+            highValue = math.max(target, lowValue)
+        end
+        render()
+        publish(false)
+    end
+    connect(hitbox.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            if Library:_isObscured(section.Window, input.Position) then
+                return
+            end
+            local target = valueAt(input)
+            if math.abs(target - lowValue) < math.abs(target - highValue) or (target <= lowValue and lowValue == highValue) then
+                dragging = "low"
+            else
+                dragging = "high"
+            end
+            drag(input)
+        end
+    end, section.Window._connections)
+    connect(UserInputService.InputChanged, function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            drag(input)
+        end
+    end, section.Window._connections)
+    connect(UserInputService.InputEnded, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = nil
+        end
+    end, section.Window._connections)
+    registerFlagSetter(section.Window, options.Flag, set)
+    set(default, true)
+    return {
+        Instance = holder,
+        Set = function(_, nextValue, silent) set(nextValue, silent) end,
+        Get = function() return { lowValue, highValue } end,
+        CompactLayout = function(_, showName, available)
+            nameLabel.Visible = showName
+            local valueWidth = available and math.clamp(math.floor(available * 0.5), 40, 72) or 72
+            valueLabel.Size = UDim2.new(0, valueWidth, 1, 0)
+            local reserve = valueWidth + 12
+            track.Position = showName and UDim2.new(0.34, 0, 0.5, 0) or UDim2.new(0, COMPACT_MARGIN, 0.5, 0)
+            setWidth(track, showName and 0.66 or 1, -(showName and COMPACT_MARGIN + reserve or COMPACT_MARGIN * 2 + reserve))
         end,
     }
 end
@@ -3915,6 +4315,9 @@ function Section:AddRangeSlider(options)
     local minimum = tonumber(options.Min) or 0
     local maximum = tonumber(options.Max) or 100
     local default = type(options.Default) == "table" and options.Default or { minimum, maximum }
+    if self._compact == true then
+        return buildCompactRange(self, options, minimum, maximum, default)
+    end
     local holder = new("Frame", {
         Name = options.Name or "RangeSlider",
         BackgroundTransparency = 1,
@@ -3922,11 +4325,15 @@ function Section:AddRangeSlider(options)
         Size = UDim2.new(1, 0, 0, 0),
         Parent = self.Container,
     })
-    new("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder, Parent = holder })
+    new("UIListLayout", {
+        Padding = UDim.new(0, self.Window._layout.ControlSpacing),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Parent = holder,
+    })
     -- The two sliders are children of the holder, not of the section, but they still
--- go through the enriched Section.Add* wrapper, which needs the same fields a
--- real section has.
-local nested = { Container = holder, Window = self.Window, Tab = self.Tab, Controls = {} }
+    -- go through the enriched Section.Add* wrapper, which needs the same fields a
+    -- real section has.
+    local nested = { Container = holder, Window = self.Window, Tab = self.Tab, Controls = {} }
     local low, high
     local function publish(silent)
         local result = { low:Get(), high:Get() }
@@ -4042,24 +4449,36 @@ local function enrichControl(control, section, options, ownedConnections, method
         connect(instance.Destroying, hideTooltip, section.Window._connections)
         connect(instance.MouseEnter, function()
             if destroyed or tooltip then return end
+            local content = tostring(options.Tooltip)
+            local bounds = measureText(content, 11, Enum.Font.Gotham, 162)
+            local width = math.clamp(math.ceil(bounds.X) + 20, 60, 180)
+            local height = math.ceil(bounds.Y) + 14
             tooltip = new("TextLabel", {
                 Name = "Tooltip",
                 BackgroundColor3 = Library.Theme.Surface,
                 BackgroundTransparency = 0.02,
                 BorderSizePixel = 0,
                 AutomaticSize = Enum.AutomaticSize.Y,
-                Text = tostring(options.Tooltip),
+                Text = content,
                 TextColor3 = Library.Theme.Text,
                 TextSize = 11,
                 Font = Enum.Font.Gotham,
                 TextWrapped = true,
-                Size = UDim2.fromOffset(180, 0),
+                TextXAlignment = Enum.TextXAlignment.Left,
+                TextYAlignment = Enum.TextYAlignment.Top,
+                Size = UDim2.fromOffset(width, 0),
                 ZIndex = 200,
                 Parent = ScreenGui,
             })
             padding(tooltip, 7, 9, 7, 9); corner(tooltip, 5)
+            stroke(tooltip, Library.Theme.Border, 1, 0.3)
             local mouse = UserInputService:GetMouseLocation()
-            tooltip.Position = UDim2.fromOffset(mouse.X + 12, mouse.Y + 12)
+            local viewport = ScreenGui.AbsoluteSize
+            local x = mouse.X + 14
+            local y = mouse.Y + 16
+            if x + width > viewport.X - 6 then x = mouse.X - width - 10 end
+            if y + height > viewport.Y - 6 then y = mouse.Y - height - 10 end
+            tooltip.Position = UDim2.fromOffset(math.max(6, x), math.max(6, y))
         end, section.Window._connections)
         connect(instance.MouseLeave, hideTooltip, section.Window._connections)
     end
@@ -4121,6 +4540,7 @@ local function enrichControl(control, section, options, ownedConnections, method
                     instance.Visible = not dependency.HiddenBySearch
                     control.Disabled = not met
                     instance:SetAttribute("BloodshotDisabled", not met)
+                    refreshVeil(instance)
                     for _, descendant in ipairs(instance:GetDescendants()) do
                         if descendant:IsA("GuiButton") or descendant:IsA("TextBox") then
                             descendant.Active = met
@@ -4230,12 +4650,25 @@ local function enrichControl(control, section, options, ownedConnections, method
             disabled = not not disabled
             self.Disabled = disabled
             instance:SetAttribute("BloodshotDisabled", disabled)
+            refreshVeil(instance)
+            local locked = disabled or instance:GetAttribute("BloodshotSectionDisabled") == true
             for _, descendant in ipairs(instance:GetDescendants()) do
                 if descendant:IsA("GuiButton") or descendant:IsA("TextBox") then
-                    descendant.Active = not disabled
-                    descendant.Selectable = not disabled
+                    descendant.Active = not locked
+                    descendant.Selectable = not locked
                 end
             end
+            return self
+        end
+    else
+        local ownDisable = control.SetDisabled
+        function control:SetDisabled(disabled, ...)
+            if destroyed or not instance then return self end
+            disabled = not not disabled
+            self.Disabled = disabled
+            instance:SetAttribute("BloodshotDisabled", disabled)
+            refreshVeil(instance)
+            ownDisable(self, disabled, ...)
             return self
         end
     end
@@ -4516,33 +4949,43 @@ function Section:AddSearch(options)
     elseif options.Target ~= nil and options.Target ~= "Section" then
         target = options.Target
     end
-    local holder, nameLabel = createControlBase(
+    local compact = self._compact == true
+    local holder, nameLabel, descriptionLabel = createControlBase(
         self,
-        40,
-        options.Name or T("SearchPlaceholder"),
+        options.Description and 58 or 46,
+        options.Name or T("Search"),
         options.Description
     )
-    nameLabel.Size = UDim2.new(1, -170, 0, 40)
+    nameLabel.Size = UDim2.new(0.4, -12, nameLabel.Size.Y.Scale, nameLabel.Size.Y.Offset)
+    if descriptionLabel then
+        descriptionLabel.Size = UDim2.new(0.4, -12, 0, 16)
+    end
+    local fixedWidth = not compact and tonumber(options.Width) or nil
     local box = new("TextBox", {
         AnchorPoint = Vector2.new(1, 0.5),
-        Position = UDim2.new(1, -10, 0.5, 0),
-        Size = UDim2.fromOffset(options.Width or 152, 26),
+        Position = UDim2.new(1, -12, 0.5, 0),
+        Size = fixedWidth and UDim2.fromOffset(fixedWidth, 28) or UDim2.new(0.52, 0, 0, 28),
         BackgroundTransparency = 0,
         BorderSizePixel = 0,
         ClearTextOnFocus = false,
         Font = Enum.Font.Gotham,
         Text = "",
-        TextSize = 11,
+        TextSize = 12,
         TextXAlignment = Enum.TextXAlignment.Left,
         PlaceholderText = options.Placeholder or T("SearchPlaceholder"),
         Parent = holder,
     })
-    constrainText(box, 8, 11)
+    constrainText(box, 8, 12)
     bindTheme(box, "BackgroundColor3", "Background")
     bindTheme(box, "TextColor3", "Text")
     bindTheme(box, "PlaceholderColor3", "MutedText")
     corner(box, 5)
     padding(box, 0, 8, 0, 8)
+    if compact then
+        nameLabel.Position = UDim2.fromOffset(COMPACT_MARGIN, 0)
+        nameLabel.Size = UDim2.new(0.4, -COMPACT_MARGIN, 1, 0)
+        box.Position = UDim2.new(1, -COMPACT_MARGIN, 0.5, 0)
+    end
     local matches = 0
     local function run(query)
         query = tostring(query or "")
@@ -4563,7 +5006,7 @@ function Section:AddSearch(options)
             nameLabel.Text = T("SearchNothingFound")
             nameLabel.TextColor3 = Library.Theme.Warning
         else
-            nameLabel.Text = options.Name or T("SearchPlaceholder")
+            nameLabel.Text = options.Name or T("Search")
             nameLabel.TextColor3 = Library.Theme.Text
         end
         commitFlag(options.Flag, query)
@@ -4589,6 +5032,10 @@ function Section:AddSearch(options)
         end,
         Clear = function() box.Text = "" end,
         GetMatches = function() return matches end,
+        CompactLayout = function(_, showName)
+            nameLabel.Visible = showName
+            setWidth(box, showName and 0.56 or 1, showName and -COMPACT_MARGIN or -COMPACT_MARGIN * 2)
+        end,
     }
 end
 
@@ -4612,6 +5059,11 @@ function Section:AddSummary(options)
         TextYAlignment = Enum.TextYAlignment.Center,
         TextXAlignment = options.Alignment or Enum.TextXAlignment.Left,
     })
+    if self._compact == true then
+        body:SetAttribute("BloodshotKeep", true)
+        body.Position = UDim2.fromOffset(COMPACT_MARGIN, 0)
+        body.Size = UDim2.new(1, -COMPACT_MARGIN * 2, 1, 0)
+    end
     local values = type(options.Values) == "table" and options.Values or {}
     local handles = {}
     local rendered = ""
@@ -4791,8 +5243,8 @@ function Section:AddList(options)
         corner(frame, 5)
         local accent = new("Frame", {
             AnchorPoint = Vector2.new(0, 0.5),
-            Position = UDim2.new(0, 6, 0.5, 0),
-            Size = UDim2.fromOffset(4, rowHeight - 10),
+            Position = UDim2.new(0, 2, 0.5, 0),
+            Size = UDim2.fromOffset(3, rowHeight - 10),
             BorderSizePixel = 0,
             Visible = false,
             Parent = frame,
@@ -5038,10 +5490,17 @@ end
 function Section:SetDisabled(disabled)
     self.Disabled = not not disabled
     if self.Container then
+        for _, child in ipairs(self.Container:GetChildren()) do
+            if child:IsA("GuiObject") and child:GetAttribute("BloodshotControl") then
+                child:SetAttribute("BloodshotSectionDisabled", self.Disabled)
+                refreshVeil(child)
+            end
+        end
         for _, descendant in ipairs(self.Container:GetDescendants()) do
             if descendant:IsA("GuiButton") or descendant:IsA("TextBox") then
-                descendant.Active = not self.Disabled
-                descendant.Selectable = not self.Disabled
+                local locked = self.Disabled or ownerDisabled(descendant, self.Container)
+                descendant.Active = not locked
+                descendant.Selectable = not locked
             end
         end
         for _, overlay in ipairs(self._overlays or {}) do
@@ -5139,7 +5598,7 @@ function Tab:SetBadge(value)
             AutomaticSize = Enum.AutomaticSize.X,
             BackgroundTransparency = 0.15,
             BorderSizePixel = 0,
-            Parent = self.Button,
+            Parent = self.Decor,
         })
         bindTheme(badge, "BackgroundColor3", "Accent")
         corner(badge, 999)
@@ -5163,16 +5622,15 @@ function Tab:SetBadge(value)
     end
     self.Badge.Visible = value ~= nil
     if value ~= nil then self.BadgeLabel.Text = value end
-    -- The badge sits over the right edge, so the label has to give up that
-    -- space or a long tab name runs underneath it.
-    local base = self.Icon and ("      " .. self.Name) or ("   " .. self.Name)
+    -- The badge sits over the right edge, so the label's text area has to give
+    -- up that space or a long tab name runs underneath it.
+    local reserve = 0
     if value ~= nil then
-        local width = #value
-        self.Button.Text = base .. string.rep(" ", math.clamp(math.ceil(width * 1.6) + 2, 4, 22))
+        reserve = math.ceil(measureText(value, 9, Library.Theme.Font or Enum.Font.Gotham, 1000).X) + 12 + 10 + 6
         self.Badge.BackgroundTransparency = self.Disabled and 0.75 or 0.15
-    else
-        self.Button.Text = base
     end
+    self.ButtonPadding.PaddingRight = UDim.new(0, reserve)
+    self.Decor.Size = UDim2.new(1, self.PadLeft + reserve, 1, 0)
     return self
 end
 
@@ -5940,6 +6398,7 @@ function Window:AddTab(name, icon)
         name = name.Name or name.Title
     end
     name = tostring(name or "Tab")
+    local padLeft = icon and 34 or 10
     local button = new("TextButton", {
         Name = name,
         -- See Tab:AddSection: creation order must win over alphabetical order.
@@ -5952,15 +6411,31 @@ function Window:AddTab(name, icon)
             or UDim2.new(1, 0, 0, self._layout.TabHeight),
         AutoButtonColor = false,
         Font = Enum.Font.GothamMedium,
-        Text = icon and ("      " .. name) or ("   " .. name),
+        Text = name,
         TextColor3 = Library.Theme.MutedText,
         TextTransparency = 0.45,
         TextSize = 12,
         TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
         Parent = self.TabList,
     })
     constrainText(button, 9, 12)
     corner(button, 5)
+    -- The label text is padded in from the left (and from the right while a
+    -- badge is showing). Decor spans the whole button regardless, so the icon,
+    -- indicator and badge keep positions measured from the button's own edges.
+    local buttonPadding = new("UIPadding", {
+        PaddingLeft = UDim.new(0, padLeft),
+        Parent = button,
+    })
+    local decor = new("Frame", {
+        Name = "Decor",
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Position = UDim2.fromOffset(-padLeft, 0),
+        Size = UDim2.new(1, padLeft, 1, 0),
+        Parent = button,
+    })
     local buttonScale = new("UIScale", {
         Scale = 0.94,
         Parent = button,
@@ -5974,7 +6449,7 @@ function Window:AddTab(name, icon)
             Size = UDim2.fromOffset(18, 18),
             Image = icon,
             ImageColor3 = Library.Theme.MutedText,
-            Parent = button,
+            Parent = decor,
         })
     end
     local indicator = new("Frame", {
@@ -5985,7 +6460,7 @@ function Window:AddTab(name, icon)
             or UDim2.new(0, 0, 0.5, 0),
         Size = self._layout.SidebarHorizontal and UDim2.fromOffset(18, 3) or UDim2.fromOffset(3, 18),
         BorderSizePixel = 0,
-        Parent = button,
+        Parent = decor,
     })
     bindTheme(indicator, "BackgroundColor3", "Accent")
     corner(indicator, 999)
@@ -6020,6 +6495,9 @@ function Window:AddTab(name, icon)
         Icon = icon,
         Badge = nil,
         BadgeValue = nil,
+        ButtonPadding = buttonPadding,
+        Decor = decor,
+        PadLeft = padLeft,
     }, Tab)
     bindThemeState(button, function()
         button.BackgroundColor3 = Library.Theme.SurfaceAlt
@@ -7324,8 +7802,8 @@ function Library:Inspect()
     local tab = window:AddTab("Diagnostics")
     local summarySection = tab:AddSection("Summary")
     local flagSection = tab:AddSection("Flags")
-    local summary = summarySection:AddParagraph({ Title = "Runtime", Content = "..." })
-    local flagBody = flagSection:AddParagraph({ Title = "Flag values", Content = "" })
+    local summary = summarySection:AddParagraph({ Title = "Runtime", Content = "...", Font = Enum.Font.Code })
+    local flagBody = flagSection:AddParagraph({ Title = "Flag values", Content = "", Font = Enum.Font.Code })
 
     local function refresh()
         local names = {}
